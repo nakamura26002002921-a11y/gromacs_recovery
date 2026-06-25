@@ -1,16 +1,19 @@
+# recovery_agent/agent.py
+
 import json
 import os
 import time
 from .observation import ObservationModule
 from .diagnosis import diagnose_error
-from .repair import get_repair_candidates, pdbfixer_add_missing_atoms
+from .repair import get_repair_candidates
+
 
 class RecoveryAgent:
     def __init__(self, config):
         self.max_attempts = config["agent"]["max_attempts"]
         self.log_dir = config["agent"]["log_dir"]
         os.makedirs(self.log_dir, exist_ok=True)
-        
+
         self.obs_module = ObservationModule(
             force_field=config["gromacs"]["force_field"],
             water_model=config["gromacs"]["water_model"]
@@ -19,22 +22,25 @@ class RecoveryAgent:
     def run(self, initial_pdb):
         current_pdb = initial_pdb
         attempt = 0
-        repair_history = []
+        repair_history = []  # op_name(文字列)のリスト
         state_logs = []
+        extra_flags = None  # 前回の修復で-ignhなどのフラグが指定された場合に保持
 
         print(f"--- Starting Recovery for {initial_pdb} ---")
 
         while attempt < self.max_attempts:
             print(f"\n[Attempt {attempt}] Observing...")
             start_time = time.time()
-            obs_result = self.obs_module.run_pdb2gmx(current_pdb)
-            
-            # [2] State Representation (simple ver)
+            obs_result = self.obs_module.run_pdb2gmx(current_pdb, additional_flags=extra_flags)
+
+            # [2] State Representation
             state = {
                 "attempt": attempt,
                 "current_pdb": current_pdb,
                 "success": obs_result["success"],
-                "repair_history": list(repair_history)
+                "repair_history": list(repair_history),
+                # 診断の正しさを後で検証できるよう、stderrの先頭部分を生のまま残す
+                "stderr_head": obs_result["stderr"][:1000],
             }
 
             if obs_result["success"]:
@@ -50,40 +56,56 @@ class RecoveryAgent:
 
             # [4] Repair Strategy Selector
             candidates = get_repair_candidates(category)
-            selected_repair = None
-            
-            for candidate in candidates:
-                if candidate not in repair_history:
-                    selected_repair = candidate
-                    break
-            
-            state["selected_repair"] = selected_repair
+            selected_fn = None
 
-            if not selected_repair:
+            for candidate_fn in candidates:
+                if candidate_fn.__name__ not in repair_history:
+                    selected_fn = candidate_fn
+                    break
+
+            state["selected_repair"] = selected_fn.__name__ if selected_fn else None
+
+            if selected_fn is None:
                 print(">> No viable repair candidates left. Terminating.")
                 state["status"] = "failed_no_candidates"
                 self._log_step(state_logs, state, time.time() - start_time)
                 break
 
-            if selected_repair in repair_history:
-                print(">> ERROR: Logic fault. Duplicate repair suggested. Force stopping.")
-                state["status"] = "error_duplicate_repair"
+            # [5] Repair Execution
+            print(f">> Executing Repair: {selected_fn.__name__}")
+            try:
+                result = selected_fn(current_pdb, attempt)
+            except Exception as e:
+                print(f">> ERROR during repair execution: {e}")
+                state["status"] = "error_repair_execution_failed"
+                state["error_detail"] = str(e)
                 self._log_step(state_logs, state, time.time() - start_time)
                 break
 
-            # [5] Repair Execution
-            print(f">> Executing Repair: {selected_repair}")
-            if selected_repair == "pdbfixer_add_missing_atoms":
-                current_pdb, op_name = pdbfixer_add_missing_atoms(current_pdb, attempt)
-                repair_history.append(op_name)
+            repair_history.append(result["op_name"])
 
+            # PDBが書き換えられた場合のみcurrent_pdbを更新する
+            # (-ignhのようにフラグだけの修復はnew_pdb_pathがNoneのままの場合がある)
+            if result.get("new_pdb_path"):
+                current_pdb = result["new_pdb_path"]
+
+            # 次のobservationで使うフラグを更新(累積させず、最新の修復のものに置き換える)
+            extra_flags = result.get("extra_flags")
+
+            state["repair_extra_flags"] = extra_flags
+            state["structure_altered"] = result.get("structure_altered", False)
             state["status"] = "repaired_and_continuing"
             self._log_step(state_logs, state, time.time() - start_time)
             attempt += 1
 
         else:
             print(">> Max attempts exceeded.")
-            state["status"] = "max_attempts_exceeded"
+            state = {
+                "attempt": attempt,
+                "current_pdb": current_pdb,
+                "repair_history": list(repair_history),
+                "status": "max_attempts_exceeded",
+            }
             self._log_step(state_logs, state, 0)
 
         self._save_jsonlines(initial_pdb, state_logs)
