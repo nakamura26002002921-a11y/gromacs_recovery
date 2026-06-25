@@ -1,12 +1,10 @@
 # recovery_agent/agent.py
-
 import json
 import os
 import time
 from .observation import ObservationModule
-from .diagnosis import diagnose_error
+from .diagnosis import diagnose_error, extract_fatal_error
 from .repair import get_repair_candidates
-
 
 class RecoveryAgent:
     def __init__(self, config):
@@ -39,8 +37,10 @@ class RecoveryAgent:
                 "current_pdb": current_pdb,
                 "success": obs_result["success"],
                 "repair_history": list(repair_history),
-                # 診断の正しさを後で検証できるよう、stderrの先頭部分を生のまま残す
-                "stderr_head": obs_result["stderr"][:1000],
+                # ★追加: 診断の根拠となったFatal errorテキストをそのまま残す
+                "fatal_error_text": extract_fatal_error(obs_result["stderr"]),
+                # 参考情報として先頭1000文字も残す
+                "stderr_head": obs_result["stderr"][:1000], 
             }
 
             if obs_result["success"]:
@@ -84,12 +84,9 @@ class RecoveryAgent:
 
             repair_history.append(result["op_name"])
 
-            # PDBが書き換えられた場合のみcurrent_pdbを更新する
-            # (-ignhのようにフラグだけの修復はnew_pdb_pathがNoneのままの場合がある)
             if result.get("new_pdb_path"):
                 current_pdb = result["new_pdb_path"]
 
-            # 次のobservationで使うフラグを更新(累積させず、最新の修復のものに置き換える)
             extra_flags = result.get("extra_flags")
 
             state["repair_extra_flags"] = extra_flags
