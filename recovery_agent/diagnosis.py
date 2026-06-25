@@ -11,8 +11,8 @@ ERROR_CATEGORIES = {
 
 def extract_fatal_error(stderr_text):
     match = re.search(
-        r"Fatal error:\s*(.*?)(?:\nFor more information|\n-{5,}|\Z)", 
-        stderr_text, 
+        r"Fatal error:\s*(.*?)(?:\nFor more information|\n-{5,}|\Z)",
+        stderr_text,
         re.DOTALL | re.IGNORECASE
     )
     if match:
@@ -21,8 +21,13 @@ def extract_fatal_error(stderr_text):
 
 def diagnose_error(stderr_text):
     fatal_section = extract_fatal_error(stderr_text)
-    search_target = fatal_section if fatal_section else stderr_text
+    if fatal_section:
+        search_target = fatal_section.replace('\n', ' ')
+    else:
+        search_target = stderr_text.replace('\n', ' ')
+        
     for category, pattern in ERROR_CATEGORIES.items():
         if re.search(pattern, search_target, re.IGNORECASE):
             return category
+            
     return "UNKNOWN"
