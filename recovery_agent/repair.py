@@ -45,16 +45,13 @@ def rename_duplicate_chain_ids(pdb_path, step_num, work_dir, **kwargs):
     op_name = "rename_duplicate_chain_ids"
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("structure", pdb_path)
-
     available_ids = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     used_ids = set()
-
     for model in structure:
         for chain in model:
             new_id = next(c for c in available_ids if c not in used_ids)
             used_ids.add(new_id)
             chain.id = new_id
-
     filename = f"step_{step_num}_{op_name}.pdb"
     new_pdb_path = os.path.join(work_dir, filename)
     io = PDBIO()
@@ -63,36 +60,18 @@ def rename_duplicate_chain_ids(pdb_path, step_num, work_dir, **kwargs):
     return {"op_name": op_name, "new_pdb_path": new_pdb_path, "extra_flags": None}
 
 def pdb2gmx_with_ignh_flag(pdb_path, step_num, work_dir, **kwargs):
-    op_name = "pdb2gmx_with_ignh_flag"
-    return {"op_name": op_name, "new_pdb_path": pdb_path, "extra_flags": ["-ignh"]}
+    return {"op_name": "pdb2gmx_with_ignh_flag", "new_pdb_path": pdb_path, "extra_flags": ["-ignh"]}
 
 def pdb2gmx_with_explicit_ter_flag(pdb_path, step_num, work_dir, **kwargs):
-    op_name = "pdb2gmx_with_explicit_ter_flag"
-    return {"op_name": op_name, "new_pdb_path": pdb_path, "extra_flags": ["-ter"]}
+    return {"op_name": "pdb2gmx_with_explicit_ter_flag", "new_pdb_path": pdb_path, "extra_flags": ["-ter"]}
 
 def remove_residue_as_last_resort(pdb_path, step_num, work_dir, residue_id=None, chain_id=None, **kwargs):
-    """
-    最終手段: 問題のある残基を削除する。
-    安全のため、鎖ID(chain_id)が特定できない場合は削除を実行しない。
-    """
     op_name = "remove_residue_as_last_resort"
-    
-    if residue_id is None:
-        return {"op_name": op_name, "new_pdb_path": None, "extra_flags": None}
-
-    # ★鎖IDが不明な場合は、過剰削除を防ぐため実行しない
-    if chain_id is None:
-        print(f">> WARNING: Cannot identify chain ID for residue {residue_id}. Skipping removal to avoid over-deletion in multimeric structures.")
-        return {
-            "op_name": op_name, 
-            "new_pdb_path": None, 
-            "extra_flags": None,
-            "error": "chain_id_not_specified"
-        }
+    if residue_id is None or chain_id is None:
+        return {"op_name": op_name, "new_pdb_path": None, "extra_flags": None, "error": "id_not_specified"}
 
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("structure", pdb_path)
-    
     try:
         target_seq_id = int(residue_id)
     except ValueError:
@@ -115,13 +94,34 @@ def remove_residue_as_last_resort(pdb_path, step_num, work_dir, residue_id=None,
     io = PDBIO()
     io.set_structure(structure)
     io.save(new_pdb_path)
-    
+    return {"op_name": op_name, "new_pdb_path": new_pdb_path, "extra_flags": None, "structure_altered": True}
+
+def strip_hetero_cofactors(pdb_path, step_num, work_dir, **kwargs):
+    """標準アミノ酸・水以外のHETATM(イオン・補因子等)を除去する"""
+    op_name = "strip_hetero_cofactors"
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("structure", pdb_path)
+
+    for model in structure:
+        for chain in model:
+            # res.id[0] が ' ' (空白) なら標準残基、'W' なら水、その他はHETATM
+            to_remove = [res for res in chain if res.id[0] != ' ' and res.resname != 'HOH']
+            for res in to_remove:
+                chain.detach_child(res.id)
+
+    filename = f"step_{step_num}_{op_name}.pdb"
+    new_pdb_path = os.path.join(work_dir, filename)
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(new_pdb_path)
+    # 補因子を消す=生物学的情報を失う、強い構造変更なので必ずフラグを立てる
     return {"op_name": op_name, "new_pdb_path": new_pdb_path, "extra_flags": None, "structure_altered": True}
 
 REPAIR_CANDIDATES = {
     "MISSING_ATOM": [pdbfixer_add_missing_atoms],
     "MISSING_RESIDUE_DB_ENTRY": [pdbfixer_replace_nonstandard_residues],
     "MISSING_HYDROGEN": [pdb2gmx_with_ignh_flag, pdbfixer_add_missing_atoms_and_hydrogens],
+    "HETERO_CHAIN_TYPE_MISMATCH": [strip_hetero_cofactors],
     "CHAIN_SPLIT": [rename_duplicate_chain_ids],
     "TERMINUS_ISSUE": [pdb2gmx_with_explicit_ter_flag],
     "UNKNOWN": [],
