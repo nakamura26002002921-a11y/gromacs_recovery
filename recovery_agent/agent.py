@@ -8,14 +8,16 @@ import shutil
 from .observation import ObservationModule
 from .diagnosis import diagnose_error, extract_fatal_error
 from .repair import get_repair_candidates
+from .utils import run_with_timeout
 
 class RecoveryAgent:
     def __init__(self, config):
         self.config = config
         self.max_attempts = config["agent"]["max_attempts"]
         self.log_dir = config["agent"]["log_dir"]
-        # work_dirを保持するかどうかの設定 (デフォルト: False=削除)
-        self.keep_work_dir = config["agent"].get("keep_work_dir", False) 
+        self.keep_work_dir = config["agent"].get("keep_work_dir", False)
+        # PDBFixer等の修復処理に対するタイムアウト(秒)
+        self.repair_timeout = config["agent"].get("repair_timeout_sec", 300)
         
         os.makedirs(self.log_dir, exist_ok=True)
 
@@ -25,27 +27,21 @@ class RecoveryAgent:
         )
 
     def _extract_repair_context(self, state):
-        """
-        エラーログから修復コンテキスト（residue_id, chain_id）を抽出する。
-        """
         context = {}
         fatal_text = state.get("fatal_error_text", "")
         if not fatal_text:
             return context
 
-        # 1. 残基番号の抽出 (例: "Residue 196 named ARG...")
+        # 残基番号の抽出
         match_res = re.search(r"Residue (\d+) named", fatal_text)
         if match_res:
             context["residue_id"] = match_res.group(1)
         else:
-            # 別の形式 (例: "Atom HB3 in residue LYS 3 was not found...")
             match_res2 = re.search(r"residue [A-Z]+ (\d+)", fatal_text)
             if match_res2:
                 context["residue_id"] = match_res2.group(1)
 
-        # 2. 鎖IDの抽出 (例: "Chain A: Residue..." 等形式が含まれる場合)
-        # ※GROMACSの標準的なFatal errorには鎖IDが含まれないことが多いが、
-        # 含まれるケースに備えて探索する。見つからなければ chain_id は設定されない(None)。
+        # 鎖IDの抽出
         match_chain = re.search(r"Chain ([A-Z])", fatal_text)
         if match_chain:
             context["chain_id"] = match_chain.group(1)
@@ -53,7 +49,6 @@ class RecoveryAgent:
         return context
 
     def run(self, initial_pdb):
-        # ★ケースごとに一意な作業ディレクトリを作成
         work_dir = tempfile.mkdtemp(prefix=f"recovery_{os.path.basename(initial_pdb)}_")
         
         current_pdb = initial_pdb
@@ -104,7 +99,6 @@ class RecoveryAgent:
                     self._log_step(state_logs, state, time.time() - start_time)
                     break
                 
-                # 現在のエラーを記録
                 previous_fatal_error = current_fatal_error
 
                 category = diagnose_error(obs_result["stderr"])
@@ -127,14 +121,29 @@ class RecoveryAgent:
                     self._log_step(state_logs, state, time.time() - start_time)
                     break
 
-                print(f">> Executing Repair: {selected_fn.__name__}")
+                print(f">> Executing Repair: {selected_fn.__name__} (Timeout: {self.repair_timeout}s)")
                 try:
                     context = self._extract_repair_context(state)
-                    result = selected_fn(current_pdb, attempt, work_dir, **context)
+                    
+                    # ★タイムアウト付きで修復実行
+                    result = run_with_timeout(
+                        selected_fn, 
+                        args=(current_pdb, attempt, work_dir), 
+                        kwargs=context, 
+                        timeout_sec=self.repair_timeout
+                    )
                 except Exception as e:
                     print(f">> ERROR during repair execution: {e}")
                     state["status"] = "error_repair_execution_failed"
                     state["error_detail"] = str(e)
+                    self._log_step(state_logs, state, time.time() - start_time)
+                    break
+
+                # タイムアウトまたはエラーで結果が返ってきた場合
+                if result.get("status") in ["repair_timeout", "repair_error"]:
+                    print(f">> Repair {result['status']}: {result.get('error')}")
+                    state["status"] = result["status"]
+                    state["error_detail"] = result.get("error")
                     self._log_step(state_logs, state, time.time() - start_time)
                     break
 
