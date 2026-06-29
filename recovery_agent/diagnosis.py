@@ -1,13 +1,37 @@
 # recovery_agent/diagnosis.py
 import re
 
-ERROR_CATEGORIES = {
-    "MISSING_HYDROGEN": r"Atom .* not found in rtp entry|Atom .*H.* not found",
-    "MISSING_ATOM": r"atom .* is missing|Long Bond|atom .* is not found in the input file",
-    "MISSING_RESIDUE_DB_ENTRY": r"Residue .* not found in residue topology database",
-    "CHAIN_SPLIT": r"moleculetype|chain identifier",
-    "TERMINUS_ISSUE": r"-ter",
-}
+def _is_missing_heavy_atom(text):
+    match = re.search(r"\batom\s+(\w+)\s+used in that entry is not found", text, re.IGNORECASE)
+    if match:
+        atom_name = match.group(1)
+        return not atom_name.upper().startswith("H")
+    return False
+
+def _is_missing_hydrogen(text):
+    match = re.search(r"\batom\s+(\w+)\s+in residue\s+\w+\s+\d+\s+was not found in rtp entry", text, re.IGNORECASE)
+    if match:
+        atom_name = match.group(1)
+        return atom_name.upper().startswith("H")
+    return False
+
+def _is_missing_residue_db_entry(text):
+    return bool(re.search(r"Residue\s+\S+\s+not found in residue topology database", text, re.IGNORECASE))
+
+def _is_chain_split_fatal(text):
+    return bool(re.search(r"\bmoleculetype\b", text, re.IGNORECASE))
+
+def _is_terminus_issue(text):
+    return bool(re.search(r"-ter\b", text, re.IGNORECASE))
+
+DIAGNOSIS_RULES = [
+    ("MISSING_HYDROGEN", _is_missing_hydrogen),
+    ("MISSING_ATOM", _is_missing_heavy_atom),
+    ("MISSING_RESIDUE_DB_ENTRY", _is_missing_residue_db_entry),
+    ("CHAIN_SPLIT", _is_chain_split_fatal),
+    ("TERMINUS_ISSUE", _is_terminus_issue),
+]
+
 
 def extract_fatal_error(stderr_text):
     match = re.search(
@@ -19,15 +43,13 @@ def extract_fatal_error(stderr_text):
         return match.group(1).strip()
     return None
 
+
 def diagnose_error(stderr_text):
     fatal_section = extract_fatal_error(stderr_text)
-    if fatal_section:
-        search_target = fatal_section.replace('\n', ' ')
-    else:
-        search_target = stderr_text.replace('\n', ' ')
-        
-    for category, pattern in ERROR_CATEGORIES.items():
-        if re.search(pattern, search_target, re.IGNORECASE):
-            return category
-            
+    search_target = (fatal_section or stderr_text).replace('\n', ' ')
+    matched = [name for name, fn in DIAGNOSIS_RULES if fn(search_target)]
+    if len(matched) > 1:
+        return f"AMBIGUOUS({'/'.join(matched)})"
+    if len(matched) == 1:
+        return matched[0]
     return "UNKNOWN"
