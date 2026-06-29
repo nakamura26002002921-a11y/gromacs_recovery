@@ -1,10 +1,12 @@
 # recovery_agent/agent.py
+
 import json
 import os
 import time
 from .observation import ObservationModule
 from .diagnosis import diagnose_error, extract_fatal_error
 from .repair import get_repair_candidates
+
 
 class RecoveryAgent:
     def __init__(self, config):
@@ -23,6 +25,7 @@ class RecoveryAgent:
         repair_history = []  # op_name(文字列)のリスト
         state_logs = []
         extra_flags = None  # 前回の修復で-ignhなどのフラグが指定された場合に保持
+        previous_fatal_error = None  # 進捗なし検知用
 
         print(f"--- Starting Recovery for {initial_pdb} ---")
 
@@ -31,16 +34,16 @@ class RecoveryAgent:
             start_time = time.time()
             obs_result = self.obs_module.run_pdb2gmx(current_pdb, additional_flags=extra_flags)
 
+            fatal_error_text = extract_fatal_error(obs_result["stderr"])
+
             # [2] State Representation
             state = {
                 "attempt": attempt,
                 "current_pdb": current_pdb,
                 "success": obs_result["success"],
                 "repair_history": list(repair_history),
-                # ★追加: 診断の根拠となったFatal errorテキストをそのまま残す
-                "fatal_error_text": extract_fatal_error(obs_result["stderr"]),
-                # 参考情報として先頭1000文字も残す
-                "stderr_head": obs_result["stderr"][:1000], 
+                "fatal_error_text": fatal_error_text,
+                "stderr_head": obs_result["stderr"][:1000],
             }
 
             if obs_result["success"]:
@@ -49,10 +52,22 @@ class RecoveryAgent:
                 self._log_step(state_logs, state, time.time() - start_time)
                 break
 
+            # ★進捗なし検知: 直前と同じFatal errorのまま、かつ既に1回以上修復を試した後なら停止
+            if attempt > 0 and fatal_error_text is not None and fatal_error_text == previous_fatal_error:
+                print(">> ERROR: Last repair had no effect on the error. Terminating to avoid wasted computation.")
+                state["status"] = "no_progress_detected"
+                self._log_step(state_logs, state, time.time() - start_time)
+                break
+
+            previous_fatal_error = fatal_error_text
+
             # [3] Diagnosis
             category = diagnose_error(obs_result["stderr"])
             state["diagnosis_category"] = category
             print(f">> Diagnosis: {category}")
+
+            if category.startswith("AMBIGUOUS"):
+                print(f">> WARNING: Ambiguous diagnosis ({category}). Treating as no viable candidates.")
 
             # [4] Repair Strategy Selector
             candidates = get_repair_candidates(category)
