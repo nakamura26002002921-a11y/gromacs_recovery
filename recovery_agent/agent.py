@@ -1,12 +1,12 @@
 # recovery_agent/agent.py
-
 import json
 import os
 import time
+import tempfile
+import re
 from .observation import ObservationModule
 from .diagnosis import diagnose_error, extract_fatal_error
 from .repair import get_repair_candidates
-
 
 class RecoveryAgent:
     def __init__(self, config):
@@ -19,30 +19,51 @@ class RecoveryAgent:
             water_model=config["gromacs"]["water_model"]
         )
 
+    def _extract_repair_context(self, state):
+        """
+        現在の状態（エラーログ）から、修復関数に渡すべき追加情報を抽出する。
+        現在は remove_residue_as_last_resort 用の residue_id 抽出のみを行う。
+        """
+        context = {}
+        fatal_text = state.get("fatal_error_text", "")
+        if fatal_text:
+            # "Residue 196 named ARG ..." から "196" を抽出
+            match = re.search(r"Residue (\d+) named", fatal_text)
+            if match:
+                context["residue_id"] = match.group(1)
+        return context
+
     def run(self, initial_pdb):
+        # ★ケースごとに一意な作業ディレクトリを作成
+        work_dir = tempfile.mkdtemp(prefix=f"recovery_{os.path.basename(initial_pdb)}_")
+        
         current_pdb = initial_pdb
         attempt = 0
-        repair_history = []  # op_name(文字列)のリスト
+        repair_history = []
         state_logs = []
-        extra_flags = None  # 前回の修復で-ignhなどのフラグが指定された場合に保持
-        previous_fatal_error = None  # 進捗なし検知用
+        extra_flags = None
 
         print(f"--- Starting Recovery for {initial_pdb} ---")
+        print(f"Work directory: {work_dir}")
 
         while attempt < self.max_attempts:
             print(f"\n[Attempt {attempt}] Observing...")
             start_time = time.time()
-            obs_result = self.obs_module.run_pdb2gmx(current_pdb, additional_flags=extra_flags)
+            
+            # work_dirを渡して実行
+            obs_result = self.obs_module.run_pdb2gmx(
+                current_pdb, 
+                work_dir, 
+                additional_flags=extra_flags
+            )
 
-            fatal_error_text = extract_fatal_error(obs_result["stderr"])
-
-            # [2] State Representation
             state = {
                 "attempt": attempt,
                 "current_pdb": current_pdb,
+                "work_dir": work_dir,
                 "success": obs_result["success"],
                 "repair_history": list(repair_history),
-                "fatal_error_text": fatal_error_text,
+                "fatal_error_text": extract_fatal_error(obs_result["stderr"]),
                 "stderr_head": obs_result["stderr"][:1000],
             }
 
@@ -52,24 +73,10 @@ class RecoveryAgent:
                 self._log_step(state_logs, state, time.time() - start_time)
                 break
 
-            # ★進捗なし検知: 直前と同じFatal errorのまま、かつ既に1回以上修復を試した後なら停止
-            if attempt > 0 and fatal_error_text is not None and fatal_error_text == previous_fatal_error:
-                print(">> ERROR: Last repair had no effect on the error. Terminating to avoid wasted computation.")
-                state["status"] = "no_progress_detected"
-                self._log_step(state_logs, state, time.time() - start_time)
-                break
-
-            previous_fatal_error = fatal_error_text
-
-            # [3] Diagnosis
             category = diagnose_error(obs_result["stderr"])
             state["diagnosis_category"] = category
             print(f">> Diagnosis: {category}")
 
-            if category.startswith("AMBIGUOUS"):
-                print(f">> WARNING: Ambiguous diagnosis ({category}). Treating as no viable candidates.")
-
-            # [4] Repair Strategy Selector
             candidates = get_repair_candidates(category)
             selected_fn = None
 
@@ -86,10 +93,13 @@ class RecoveryAgent:
                 self._log_step(state_logs, state, time.time() - start_time)
                 break
 
-            # [5] Repair Execution
             print(f">> Executing Repair: {selected_fn.__name__}")
             try:
-                result = selected_fn(current_pdb, attempt)
+                # ★コンテキスト（residue_id等）を抽出して渡す
+                context = self._extract_repair_context(state)
+                
+                # work_dirとcontextを渡して修復実行
+                result = selected_fn(current_pdb, attempt, work_dir, **context)
             except Exception as e:
                 print(f">> ERROR during repair execution: {e}")
                 state["status"] = "error_repair_execution_failed"
@@ -115,6 +125,7 @@ class RecoveryAgent:
             state = {
                 "attempt": attempt,
                 "current_pdb": current_pdb,
+                "work_dir": work_dir,
                 "repair_history": list(repair_history),
                 "status": "max_attempts_exceeded",
             }
