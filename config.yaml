@@ -1,6 +1,8 @@
 gromacs:
-  force_field: "amber99sb"
+  force_field: "amber99sb-ildn"
   water_model: "tip3p"
 agent:
   max_attempts: 10
   log_dir: "logs"
+  keep_work_dir: false
+  output_dir: "results" 
