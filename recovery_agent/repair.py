@@ -117,9 +117,24 @@ def strip_hetero_cofactors(pdb_path, step_num, work_dir, **kwargs):
     # 補因子を消す=生物学的情報を失う、強い構造変更なので必ずフラグを立てる
     return {"op_name": op_name, "new_pdb_path": new_pdb_path, "extra_flags": None, "structure_altered": True}
 
+def strip_unknown_residue(pdb_path, step_num, work_dir, missing_residue_name=None, **kwargs):
+    op_name = "strip_unknown_residue"
+    if not missing_residue_name:
+        return strip_hetero_cofactors(pdb_path, step_num, work_dir, **kwargs)
+    class ResidueSelect(Select):
+        def accept_residue(self, residue):
+            return residue.get_resname().strip() != missing_residue_name
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("temp", pdb_path)
+    out_path = os.path.join(work_dir, f"step_{step_num}_{op_name}.pdb")
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(out_path, select=ResidueSelect())
+    return {"op_name": op_name, "new_pdb_path": out_path, "extra_flags": None, "structure_altered": True}
+
 REPAIR_CANDIDATES = {
     "MISSING_ATOM": [pdbfixer_add_missing_atoms],
-    "MISSING_RESIDUE_DB_ENTRY": [pdbfixer_replace_nonstandard_residues],
+    "MISSING_RESIDUE_DB_ENTRY": [strip_unknown_residue, pdbfixer_replace_nonstandard_residues],
     "MISSING_HYDROGEN": [pdb2gmx_with_ignh_flag, pdbfixer_add_missing_atoms_and_hydrogens],
     "HETERO_CHAIN_TYPE_MISMATCH": [strip_hetero_cofactors],
     "CHAIN_SPLIT": [rename_duplicate_chain_ids],
