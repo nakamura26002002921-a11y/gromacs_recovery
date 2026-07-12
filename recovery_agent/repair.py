@@ -2,7 +2,7 @@
 import os
 from pdbfixer import PDBFixer
 from openmm.app import PDBFile
-from Bio.PDB import PDBParser, PDBIO
+from Bio.PDB import PDBParser, PDBIO, Select
 
 def _save_fixer_output(fixer, step_num, op_name, work_dir):
     filename = f"step_{step_num}_{op_name}.pdb"
