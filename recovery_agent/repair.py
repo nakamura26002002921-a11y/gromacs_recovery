@@ -134,7 +134,7 @@ def strip_unknown_residue(pdb_path, step_num, work_dir, missing_residue_name=Non
 
 REPAIR_CANDIDATES = {
     "MISSING_ATOM": [pdbfixer_add_missing_atoms],
-    "MISSING_RESIDUE_DB_ENTRY": [strip_unknown_residue, pdbfixer_replace_nonstandard_residues],
+    "MISSING_RESIDUE_DB_ENTRY": [strip_unknown_residue, pdbfixer_replace_nonstandard_residues, strip_hetero_cofactors],
     "MISSING_HYDROGEN": [pdb2gmx_with_ignh_flag, pdbfixer_add_missing_atoms_and_hydrogens],
     "HETERO_CHAIN_TYPE_MISMATCH": [strip_hetero_cofactors],
     "CHAIN_SPLIT": [rename_duplicate_chain_ids],
