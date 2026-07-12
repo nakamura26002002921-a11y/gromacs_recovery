@@ -69,7 +69,6 @@ class RecoveryAgent:
         repair_history = []
         state_logs = []
         extra_flags = None
-        previous_fatal_error = None
 
         print(f"--- Starting Recovery for {initial_pdb} ---")
         print(f"Work directory: {work_dir}")
@@ -102,16 +101,6 @@ class RecoveryAgent:
                     self._save_final_pdb(current_pdb, initial_pdb)
                     break
 
-                current_fatal_error = state.get("fatal_error_text")
-
-                if attempt > 0 and current_fatal_error and current_fatal_error == previous_fatal_error:
-                    print(">> ERROR: Last repair had no effect. Terminating.")
-                    state["status"] = "failed_no_progress"
-                    self._log_step(state_logs, state, time.time() - start_time)
-                    break
-                
-                previous_fatal_error = current_fatal_error
-
                 category = diagnose_error(obs_result["stderr"])
                 state["diagnosis_category"] = category
                 print(f">> Diagnosis: {category}")
@@ -125,6 +114,10 @@ class RecoveryAgent:
 
                 state["selected_repair"] = selected_fn.__name__ if selected_fn else None
 
+                # 試すべき候補がまだ残っている限りは、同じエラー文言が
+                # 連続していても諦めずに次の候補を試す。
+                # (repair_historyにより同じ関数が二度呼ばれることはないため、
+                #  候補は必ず有限個で尽きるので無限ループにはならない)
                 if selected_fn is None:
                     print(">> No viable repair candidates left. Terminating.")
                     state["status"] = "failed_no_candidates"
