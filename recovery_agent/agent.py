@@ -157,7 +157,13 @@ class RecoveryAgent:
                 repair_history.append(result["op_name"])
                 if result.get("new_pdb_path"):
                     current_pdb = result["new_pdb_path"]
-                extra_flags = result.get("extra_flags")
+                # 既存のextra_flags(-ignhなど)を消さずに積み重ねる。
+                # 上書きすると、以前の修復で有効になったフラグが
+                # 後続の(フラグを返さない)修復によって失われてしまう。
+                new_flags = result.get("extra_flags")
+                if new_flags:
+                    merged = list(dict.fromkeys((extra_flags or []) + new_flags))
+                    extra_flags = merged
 
                 state["repair_extra_flags"] = extra_flags
                 state["structure_altered"] = result.get("structure_altered", False)
