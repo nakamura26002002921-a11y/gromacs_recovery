@@ -30,17 +30,24 @@ class RecoveryAgent:
         )
 
     def _extract_repair_context(self, state):
-        # ... (前回と同じ) ...
         context = {}
         fatal_text = state.get("fatal_error_text", "")
-        if not fatal_text: return context
+        if not fatal_text: 
+            return context
         match_res = re.search(r"Residue (\d+) named", fatal_text)
-        if match_res: context["residue_id"] = match_res.group(1)
+        if match_res: 
+            context["residue_id"] = match_res.group(1)
         else:
             match_res2 = re.search(r"residue [A-Z]+ (\d+)", fatal_text)
-            if match_res2: context["residue_id"] = match_res2.group(1)
+            if match_res2: 
+                context["residue_id"] = match_res2.group(1)
         match_chain = re.search(r"Chain ([A-Z])", fatal_text)
-        if match_chain: context["chain_id"] = match_chain.group(1)
+        if match_chain: 
+            context["chain_id"] = match_chain.group(1)
+        match_res_name = re.search(r"Residue '(\w+)' not found in residue topology database", fatal_text)
+        if match_res_name:
+            context["missing_residue_name"] = match_res_name.group(1)
+            
         return context
 
     # ★追加: 最終PDBを保存するメソッド
