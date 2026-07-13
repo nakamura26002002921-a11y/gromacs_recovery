@@ -1,10 +1,10 @@
 gromacs:
-  force_field: "amber99sb-ildn"
-  water_model: "tip3p"
+  force_field: "amber99sb"
+  water_model: "spc"
 agent:
   max_attempts: 10
   log_dir: "logs"
-  keep_work_dir: false
+  keep_work_dir: true
   output_dir: "results"
 rfdiffusion:
   script_path: "/path/to/RFdiffusion/scripts/run_inference.py"
