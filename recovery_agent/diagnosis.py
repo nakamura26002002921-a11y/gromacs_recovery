@@ -27,6 +27,29 @@ def _is_chain_split_fatal(text):
 def _is_terminus_issue(text):
     return bool(re.search(r"-ter\b", text, re.IGNORECASE))
 
+def _is_local_residue_issue(text):
+    patterns = [
+        r"Incomplete ring in (\w+)(\d+)",
+        r"residue (\w+) (\d+) .* (missing|incomplete|not found)",
+        r"Atom \w+ is missing in residue (\w+) (\d+)"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            if "Incomplete ring" in pattern:
+                res_name = match.group(1).upper()
+                res_id = match.group(2)
+            else:
+                res_name = match.group(1).upper()
+                res_id = match.group(2)
+                
+            return True, {"res_name": res_name, "res_id": res_id}
+    return False, {}
+
+def _is_local_residue_issue_wrapper(text):
+    is_match, info = _is_local_residue_issue(text)
+    return is_match, info
+
 DIAGNOSIS_RULES = [
     ("MISSING_HYDROGEN", _is_missing_hydrogen),
     ("MISSING_ATOM", _is_missing_heavy_atom),
@@ -34,6 +57,7 @@ DIAGNOSIS_RULES = [
     ("HETERO_CHAIN_TYPE_MISMATCH", _is_hetero_chain_type_mismatch),
     ("CHAIN_SPLIT", _is_chain_split_fatal),
     ("TERMINUS_ISSUE", _is_terminus_issue),
+    ("LOCAL_RESIDUE_ISSUE", _is_local_residue_issue_wrapper),
 ]
 
 def extract_fatal_error(stderr_text):
