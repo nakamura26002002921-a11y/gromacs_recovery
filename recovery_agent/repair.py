@@ -132,6 +132,25 @@ def strip_unknown_residue(pdb_path, step_num, work_dir, missing_residue_name=Non
     io.save(out_path, select=ResidueSelect())
     return {"op_name": op_name, "new_pdb_path": out_path, "extra_flags": None, "structure_altered": True}
 
+
+def pdbfixer_local_repair(pdb_path, attempt, work_dir, **kwargs):
+    fixer = PDBFixer(filename=pdb_path)
+    error_info = kwargs.get("error_info", {})
+    if error_info:
+        print(f"  -> Targeting local repair for residue: {error_info.get('res_name')} {error_info.get('res_id')}")
+    fixer.addMissingAtoms()
+    fixer.addMissingHydrogens(7.0)
+    out_path = os.path.join(work_dir, f"local_repaired_attempt_{attempt}.pdb")
+    with open(out_path, 'w') as f:
+        PDBFile.writeFile(fixer.topology, fixer.positions, f)
+    return {
+        "status": "success",
+        "op_name": "pdbfixer_local_repair",
+        "new_pdb_path": out_path
+    }
+
+
+
 REPAIR_CANDIDATES = {
     "MISSING_ATOM": [pdbfixer_add_missing_atoms],
     "MISSING_RESIDUE_DB_ENTRY": [strip_unknown_residue, pdbfixer_replace_nonstandard_residues, strip_hetero_cofactors],
@@ -139,6 +158,7 @@ REPAIR_CANDIDATES = {
     "HETERO_CHAIN_TYPE_MISMATCH": [strip_hetero_cofactors],
     "CHAIN_SPLIT": [rename_duplicate_chain_ids],
     "TERMINUS_ISSUE": [pdb2gmx_with_explicit_ter_flag],
+    "LOCAL_RESIDUE_ISSUE": [pdbfixer_local_repair],
     "UNKNOWN": [],
 }
 
