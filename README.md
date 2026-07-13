@@ -41,61 +41,82 @@ graph TD
 
 | ソフトウェア | 用途 | 備考 |
 |---|---|---|
-| Python 3.10以上 | 全体の実行環境 | 3.12で動作確認 |
-| GROMACS（`gmx`コマンド） | 前処理（pdb2gmx）の実行 | `gmx`がPATH上にあること |
-| RFdiffusion | 大きな欠損（6残基以上）の補完 | GPU（CUDA対応）を推奨 |
+| Anaconda / Miniconda | 環境構築 | `conda`コマンドが使えること |
+| GROMACS（`gmx`コマンド） | 前処理（pdb2gmx）の実行 | `gmx`がPATH上にあること（別途インストール） |
+| RFdiffusion | 大きな欠損（6残基以上）の補完 | GPU（CUDA 12.1対応）を推奨 |
+
+本エージェント（`gromacs_recovery`）とRFdiffusionは、依存パッケージの衝突を避けるため
+**1つのconda環境（`SE3nv`）に同梱**する構成にしています。動作確認済み: **Python 3.10 / PyTorch 2.4.1 / CUDA 12.1 / dgl 1.1.3**。
 
 ### 1.2 GROMACSのインストール
 
-公式手順に従ってビルド・インストールし、`gmx`コマンドがPATHに通っていることを確認してください。
+conda環境とは別に、公式手順に従ってビルド・インストールし、`gmx`コマンドがPATHに通っていることを確認してください。
 
 ```bash
 gmx --version
 ```
 
-### 1.3 RFdiffusionのセットアップ
-
-本エージェントは `RFdiffusion` を **サブプロセスとして呼び出す**ため、事前に別途セットアップしておく必要があります。
+### 1.3 RFdiffusion + gromacs_recovery のconda環境構築
 
 ```bash
 git clone https://github.com/RosettaCommons/RFdiffusion.git
 cd RFdiffusion
+```
 
-# 公式手順に従い環境構築（conda環境例）
-conda env create -f env/SE3nv.yml
+本リポジトリ同梱の `environment.yml` を **RFdiffusionリポジトリの直下** にコピーしてから実行してください
+（`pip`セクション内の `-e ./env/SE3Transformer` と `-e .` はこの `environment.yml` 自身の場所からの相対パスとして解決されるため、置き場所が重要です）。
+
+```bash
+cp /path/to/gromacs_recovery/environment.yml ./environment.yml
+
+conda env create -f environment.yml
 conda activate SE3nv
-pip install -e .
+```
 
-# 学習済みモデル重みをダウンロード（公式スクリプト）
+これ1本で以下が全て行われます。
+
+- Python 3.10 / PyTorch 2.4 / CUDA 12.1 の基盤構築
+- `dgl==1.1.3`（`graphbolt`非搭載版。新しいdglだと`torchdata.datapipes`関連のエラーになるため固定）
+- RFdiffusion本体が要求する依存（`hydra-core`, `omegaconf`, `e3nn` など）
+- `env/SE3Transformer` → `rfdiffusion`本体 の順でのeditableインストール
+- `gromacs_recovery`（本エージェント）側の依存（`langgraph`, `pdbfixer`, `openmm`, `biopython`, `pyyaml`）
+
+動作確認:
+
+```bash
+python scripts/run_inference.py --help
+python -c "import rfdiffusion, langgraph, pdbfixer; print('OK')"
+```
+
+続いて、学習済みモデル重みをダウンロードします。
+
+```bash
 bash scripts/download_models.sh ./models
 ```
 
-セットアップ後、`config.yaml` に以下のパスを設定します（後述）。
+`config.yaml` には以下のパスを設定します（後述）。
 
 - `scripts/run_inference.py` の絶対パス
 - ダウンロードした重みディレクトリ（`./models`）の絶対パス
 
 > RFdiffusionの実行にはNVIDIA GPU（CUDA）が事実上必須です。CPUのみの環境では現実的な時間で完了しません。
 
-### 1.4 Pythonパッケージのインストール
+#### うまくいかない場合（手動インストール）
 
-本リポジトリ用の仮想環境を作成し、以下をインストールします。
+`environment.yml`は`pip`セクションを1回の`pip install`にまとめて実行するため、
+ローカルパッケージ（`env/SE3Transformer`・`rfdiffusion`本体）の依存解決順序によっては失敗することがあります。
+その場合は以下の順序で手動インストールしてください（実機で動作確認済みの手順です）。
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate   # Windowsの場合: venv\Scripts\activate
+conda env create -f environment.yml   # 失敗しても基盤(python/pytorch/dgl等)は入る
+conda activate SE3nv
 
-pip install langgraph pdbfixer openmm biopython pyyaml
+cd RFdiffusion
+pip install -e env/SE3Transformer   # 先にSE3Transformerを入れる
+pip install -e .                    # 次にrfdiffusion本体
+pip install "dgl==1.1.3" -f https://data.dgl.ai/wheels/torch-2.4/cu121/repo.html   # dglを対応版に固定
+pip install langgraph pdbfixer openmm biopython pyyaml   # gromacs_recovery側の依存
 ```
-
-| パッケージ | 用途 |
-|---|---|
-| `langgraph` | 修復フローの状態遷移グラフ（本体） |
-| `pdbfixer` / `openmm` | 欠損残基のカウント・小規模欠損の修復（1〜5残基） |
-| `biopython` | 鎖ID重複修正・不要残基除去などの構造編集 |
-| `pyyaml` | `config.yaml` の読み込み |
-
-> `RFdiffusion`用のconda環境（SE3nv）と本エージェント用のPython環境は、依存パッケージの衝突を避けるため**別環境として分離**することを推奨します。エージェント側からは `subprocess` 経由でRFdiffusion側のPythonを呼び出す構成になっているため、`config.yaml` の `script_path` にRFdiffusion環境の `run_inference.py` を指定してください。
 
 ---
 
@@ -176,7 +197,10 @@ print(result["success"], result.get("status"), result.get("pdb_path"))
 | 症状 | 対処 |
 |---|---|
 | `EnvironmentError: GROMACS ('gmx' command) is not found in PATH.` | GROMACSをインストールし、`gmx`にPATHを通してください |
-| RFdiffusion呼び出しで `RuntimeError: RFdiffusion failed: ...` | `config.yaml` の `script_path` / `model_directory_path` が正しいか、RFdiffusion用のconda環境がactivateされた状態でPythonが呼ばれているか確認してください |
+| `ModuleNotFoundError: No module named 'rfdiffusion'` | `rfdiffusion`本体がインストールされていません。1.3節の手順で `env/SE3Transformer` → `.` の順にeditableインストールしてください |
+| `pip install -e .` で `No matching distribution found for se3-transformer` | `rfdiffusion`の依存`se3-transformer`はPyPI非公開のローカルパッケージです。先に `pip install -e env/SE3Transformer` を実行してから `pip install -e .` してください |
+| `ModuleNotFoundError: No module named 'torchdata.datapipes'` | dgl 2.x系の`graphbolt`が新しい`torchdata`と非互換です。`pip install "dgl==1.1.3" -f https://data.dgl.ai/wheels/torch-2.4/cu121/repo.html` で`graphbolt`非搭載版に固定してください |
+| RFdiffusion呼び出しで `RuntimeError: RFdiffusion failed: ...`（上記以外） | `config.yaml` の `script_path` / `model_directory_path` が正しいか、`SE3nv`環境がactivateされた状態でPythonが呼ばれているか確認してください |
 | `pdb2gmx` が毎回同じエラーで失敗する | `logs/` 以下のログ、および `diagnosis.py` の分類ルールに該当エラーが定義されているか確認してください |
 | 最大試行回数で終了する | `config.yaml` の `agent.max_attempts` を増やす、または対象PDBの欠損箇所を手動確認してください |
 
@@ -188,6 +212,7 @@ print(result["success"], result.get("status"), result.get("pdb_path"))
 gromacs_recovery-main/
 ├── main.py                          # エントリーポイント
 ├── config.yaml                      # 設定ファイル
+├── environment.yml                  # RFdiffusion+本エージェント用conda環境定義（RFdiffusionリポジトリ直下に配置して使用）
 ├── recovery_agent/
 │   ├── graph.py                     # LangGraphによる修復フロー本体
 │   ├── missing_residues.py          # 欠損残基数のカウント（PDBfixer）
@@ -198,3 +223,4 @@ gromacs_recovery-main/
 │   └── utils.py                     # タイムアウト付き関数実行
 └── tests/
 ```
+
