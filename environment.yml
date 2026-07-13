@@ -1,4 +1,4 @@
-name: SE3nv
+# environment.yml
 channels:
   - pytorch
   - nvidia
@@ -13,18 +13,18 @@ dependencies:
   - torchaudio
   - pip
   - pip:
-    # --- RFdiffusion本体 ---
-    - dgl==1.1.3 -f https://data.dgl.ai/wheels/torch-2.4/cu121/repo.html
-    - hydra-core
-    - pyrsistent
-    - omegaconf
-    - e3nn
-    - opt_einsum
-    - opt_einsum_fx
+      - hydra-core
+      - pyrsistent
+      - omegaconf
+      - e3nn
+      - opt_einsum
+      - opt_einsum_fx
 
-    # --- gromacs_recovery（LangGraphエージェント側） ---
-    - langgraph
-    - pdbfixer
-    - openmm
-    - biopython
-    - pyyaml
+      - -e ./env/SE3Transformer
+      - -e .
+
+      - langgraph
+      - pdbfixer
+      - openmm
+      - biopython
+      - pyyaml
