@@ -1,0 +1,30 @@
+name: SE3nv
+channels:
+  - pytorch
+  - nvidia
+  - dglteam
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.4.*
+  - pytorch-cuda=12.1
+  - torchvision
+  - torchaudio
+  - pip
+  - pip:
+    # --- RFdiffusion本体 ---
+    - dgl==1.1.3 -f https://data.dgl.ai/wheels/torch-2.4/cu121/repo.html
+    - hydra-core
+    - pyrsistent
+    - omegaconf
+    - e3nn
+    - opt_einsum
+    - opt_einsum_fx
+
+    # --- gromacs_recovery（LangGraphエージェント側） ---
+    - langgraph
+    - pdbfixer
+    - openmm
+    - biopython
+    - pyyaml
