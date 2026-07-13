@@ -5,4 +5,14 @@ agent:
   max_attempts: 10
   log_dir: "logs"
   keep_work_dir: false
-  output_dir: "results" 
+  output_dir: "results"
+  repair_timeout_sec: 300
+rfdiffusion:
+  # この残基数以上のループ欠損が検出されたらRFdiffusionでの再構築を優先する
+  missing_residue_threshold: 6
+  # run_inference.pyへのパス。nullの場合は環境変数
+  # RFDIFFUSION_RUN_INFERENCE (未設定時は /opt/RFdiffusion/scripts/run_inference.py) を使用
+  run_inference_script: null
+  # RFdiffusion本体の実行タイムアウト(秒)。nullの場合は環境変数
+  # RFDIFFUSION_TIMEOUT_SEC (未設定時は1800秒) を使用
+  timeout_sec: null
