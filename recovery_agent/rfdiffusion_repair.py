@@ -6,7 +6,7 @@ from pdbfixer import PDBFixer
 
 def _build_contig(fixer):
     """各鎖に欠損箇所が高々1つある前提でRFdiffusionのcontig文字列を作る"""
-    parts = []
+    chain_groups = []  # チェーンごとのトークンのリストのリスト
     for chain in fixer.topology.chains():
         residues = list(chain.residues())
         if not residues:
@@ -18,18 +18,21 @@ def _build_contig(fixer):
         )
         start_num, end_num = int(residues[0].id), int(residues[-1].id)
         if gap is None:
-            parts.append(f"{cid}{start_num}-{end_num}")
+            chain_groups.append([f"{cid}{start_num}-{end_num}"])
             continue
         pos, names = gap
         gap_len = len(names)
         if pos == 0:
-            parts += [f"{gap_len}-{gap_len}", f"{cid}{start_num}-{end_num}"]
+            chain_groups.append([f"{gap_len}-{gap_len}", f"{cid}{start_num}-{end_num}"])
         elif pos >= len(residues):
-            parts += [f"{cid}{start_num}-{end_num}", f"{gap_len}-{gap_len}"]
+            chain_groups.append([f"{cid}{start_num}-{end_num}", f"{gap_len}-{gap_len}"])
         else:
             mid_num, next_num = int(residues[pos - 1].id), int(residues[pos].id)
-            parts += [f"{cid}{start_num}-{mid_num}", f"{gap_len}-{gap_len}", f"{cid}{next_num}-{end_num}"]
-    return "/".join(parts)
+            chain_groups.append(
+                [f"{cid}{start_num}-{mid_num}", f"{gap_len}-{gap_len}", f"{cid}{next_num}-{end_num}"]
+            )
+    # 同一チェーン内は "/" で連結、チェーン間(=新しい鎖の開始)は "," で区切る
+    return ",".join("/".join(group) for group in chain_groups)
 
 
 def run_rfdiffusion(pdb_path, work_dir, rf_config):
