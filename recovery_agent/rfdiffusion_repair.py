@@ -54,9 +54,16 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
     側鎖やHETATM(水・イオン・補因子等)を含まない。そのまま採用すると構造の大部分を
     失ってしまうため、.trbの対応表(con_hal_pdb_idx <-> con_ref_pdb_idx)を使って
     「実際に新規生成された(=対応表に無い)残基」だけを元の全原子構造に差し込む。
+
+    注意: hal側の残基番号はRFdiffusionが全長(固定領域+新規生成領域)を通し番号で
+    振り直したものであり、元のPDBの番号(欠番のあるオリジナル番号)とは無関係。
+    新規残基をそのまま元の鎖に足すと番号がずれてしまうため、con_ref_pdb_idxで
+    分かる前後の既存残基の「元の番号」から補間して正しい番号を割り当てる。
     """
     trb = _load_trb(trb_path)
-    kept_hal_keys = {(chain, int(resnum)) for chain, resnum in trb["con_hal_pdb_idx"]}
+    hal_idx = [(c, int(r)) for c, r in trb["con_hal_pdb_idx"]]
+    ref_idx = [(c, int(r)) for c, r in trb["con_ref_pdb_idx"]]
+    hal_to_ref = dict(zip(hal_idx, ref_idx))  # hal(出力側)の(鎖,番号) -> ref(元)の(鎖,番号)
 
     parser = PDBParser(QUIET=True)
     orig_structure = parser.get_structure("orig", original_pdb_path)
@@ -64,17 +71,43 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
     orig_model, hal_model = orig_structure[0], hal_structure[0]
 
     for hal_chain in hal_model:
-        cid = hal_chain.id
-        if cid not in orig_model:
+        hal_cid = hal_chain.id
+        # このhal鎖が元のどの鎖に対応するかは、con_hal_pdb_idx/con_ref_pdb_idxのマッピングから判定する
+        ref_cid = next((rc for (hc, _), (rc, _) in zip(hal_idx, ref_idx) if hc == hal_cid), hal_cid)
+        if ref_cid not in orig_model:
             continue  # 新規鎖の追加には未対応(既存鎖内の欠損補完のみサポート)
-        orig_chain = orig_model[cid]
+        orig_chain = orig_model[ref_cid]
+
+        prev_ref_resnum = None   # 直前に確定した既存残基の「元の番号」
+        pending_new = []         # まだ番号が確定していない新規残基(hal順)
+
+        def _flush(next_ref_resnum):
+            if not pending_new:
+                return
+            if prev_ref_resnum is not None:
+                start = prev_ref_resnum + 1
+            elif next_ref_resnum is not None:
+                start = next_ref_resnum - len(pending_new)
+            else:
+                start = 1  # 前後どちらの手がかりも無い場合の最終手段
+            for offset, hal_res in enumerate(pending_new):
+                new_id = (" ", start + offset, " ")
+                if new_id in orig_chain:
+                    orig_chain.detach_child(new_id)
+                hal_res.id = new_id
+                orig_chain.add(hal_res)
+            pending_new.clear()
+
         for hal_res in hal_chain:
-            if (cid, hal_res.id[1]) in kept_hal_keys:
-                continue  # 既存領域: オリジナルの全原子座標をそのまま維持
-            # 新規に設計された残基 -> 元の鎖に挿入(既存の同IDプレースホルダがあれば置換)
-            if hal_res.id in orig_chain:
-                orig_chain.detach_child(hal_res.id)
-            orig_chain.add(hal_res.copy())
+            key = (hal_cid, hal_res.id[1])
+            if key in hal_to_ref:
+                _, ref_resnum = hal_to_ref[key]
+                _flush(ref_resnum)         # ここまで溜まっていた新規残基に番号を確定させる
+                prev_ref_resnum = ref_resnum
+            else:
+                pending_new.append(hal_res.copy())
+        _flush(None)
+
         orig_chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))  # resseq順に並べ直す
 
     out_path = os.path.join(work_dir, "rfdiffusion_merged.pdb")
