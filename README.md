@@ -85,7 +85,66 @@ graph TD
     style H fill:#ff9,stroke:#333,stroke-width:2px
 ```
 
+
 ---
+
+### 🎯 RFdiffusion の目的関数 (Objective Function)
+
+RFdiffusion は、拡散モデルの標準的な学習目標である **「ノイズ予測の平均二乗誤差（MSE）」** を最小化するように訓練されます。タンパク質構造は「並進（座標）」と「回転（オリエンテーション）」の2つの要素で構成されるため、目的関数もこれらを別々に評価して重み付け和を取ります。
+
+数式では以下のように定義されます。
+
+$$ \mathcal{L} = \mathbb{E}_{t, \mathbf{x}_0, \boldsymbol{\epsilon}} \left[ w_t \left( \lambda_{\text{trans}} \| \boldsymbol{\epsilon}_{\theta}^{\text{trans}}(\mathbf{x}_t, t) - \boldsymbol{\epsilon}^{\text{trans}} \|^2 + \lambda_{\text{rot}} \| \boldsymbol{\epsilon}_{\theta}^{\text{rot}}(\mathbf{x}_t, t) - \boldsymbol{\epsilon}^{\text{rot}} \|^2 \right) \right] $$
+
+**変数の意味:**
+- $\mathbf{x}_0$ : 元の（ノイズのない）タンパク質構造（並進座標と回転フレーム）
+- $\mathbf{x}_t$ : 時刻 $t$ においてガウスノイズ $\boldsymbol{\epsilon}$ が加えられた構造
+- $\boldsymbol{\epsilon}_{\theta}^{\text{trans}}, \boldsymbol{\epsilon}_{\theta}^{\text{rot}}$ : RoseTTAFoldネットワークが予測するノイズ
+- $\lambda_{\text{trans}}, \lambda_{\text{rot}}$ : 並進と回転の損失に対する重み係数
+- $w_t$ : 時間ステップ $t$ に依存する重み（通常、ノイズが多い初期ステップを重視する）
+
+**最適化の本質:**
+ネットワーク $\theta$ は、「現在のノイズまみれの構造 $\mathbf{x}_t$ と時間 $t$」を入力として受け取り、「その構造にどのようなノイズが加えられたか」を予測することを学習します。生成時（推論時）は、この学習済みネットワークを使って**ノイズを逆向きに除去（Denoising）** していきます。
+
+---
+
+### 📊 RFdiffusion の生成アルゴリズムフロー (`graph TD`)
+
+RFdiffusion が「ランダムなノイズ」から「意味のあるタンパク質構造」を生成する（逆拡散プロセス）際のアルゴリズムを可視化しました。特に、あなたのエージェントが直面する「欠損残基の補完（Inpainting）」を考慮した条件付き生成のフローを含めています。
+
+```mermaid
+graph TD
+    A[開始: 純粋なガウスノイズ構造 x_T の生成] --> B{条件付け Conditioning の適用}
+    
+    B --> |Inpainting/部分固定の場合| C[既知の残基座標・配列を固定し、未知領域のみをノイズとして保持]
+    B --> |De novo設計の場合| D[対称性制約 Symmetry や バインダー条件などを適用]
+    
+    C --> E[逆拡散ループ開始: t = T down to 1]
+    D --> E
+    
+    E --> F[1. RoseTTAFoldネットワークへの入力]
+    F --> |x_t と 時間ステップ t| G[2. ノイズの予測 ε_θ^trans, ε_θ^rot]
+    
+    G --> H{Classifier-Free Guidance CFG の適用}
+    H --> |条件付き予測と無条件予測を線形結合| I[3. 誘導されたノイズ予測の計算]
+    
+    I --> J[4. 逆拡散ステップ: x_{t-1} のサンプリング]
+    J --> |DDIM または DDPMスケジューラに基づく更新| K{投影・制約の適用 Projection}
+    
+    K --> |Inpaintingの場合| L[既知の残基座標を元の値に強制的に上書き]
+    K --> |対称性設計の場合| M[対称操作を適用して構造を強制対称化]
+    L --> N{t > 1 ?}
+    M --> N
+    N --> |Yes| E
+    N --> |No| O[出力: ノイズが除去された最終バックボーン構造 x_0]
+    
+    O --> P[後処理: ProteinMPNNによる配列設計 → AlphaFold2による構造検証]
+    
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style O fill:#bbf,stroke:#333,stroke-width:2px
+    style L fill:#ff9,stroke:#333,stroke-width:2px
+    style H fill:#9f9,stroke:#333,stroke-width:2px
+```
 
 
 ## 1. 環境構築
