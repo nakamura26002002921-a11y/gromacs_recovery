@@ -62,3 +62,4 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config):
     if not os.path.exists(new_pdb_path):
         raise RuntimeError(f"RFdiffusion output not found: {new_pdb_path}")
     return new_pdb_path
+
