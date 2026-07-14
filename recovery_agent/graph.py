@@ -8,7 +8,7 @@ from pdbfixer import PDBFixer
 from openmm.app import PDBFile
 
 from .observation import ObservationModule
-from .diagnosis import diagnose_error, extract_fatal_error
+from .diagnosis import diagnose_error, extract_fatal_error, extract_local_residue_info
 from .repair import get_repair_candidates
 from .utils import run_with_timeout
 from .missing_residues import count_missing_residues
@@ -39,6 +39,10 @@ def _extract_context(fatal_text):
     mn = re.search(r"Residue '(\w+)' not found in residue topology database", fatal_text)
     if mn:
         context["missing_residue_name"] = mn.group(1)
+    is_local, local_info = extract_local_residue_info(fatal_text)
+    if is_local:
+        context["res_name"] = local_info["res_name"]
+        context["res_id"] = local_info["res_id"]
     return context
 
 
