@@ -27,28 +27,25 @@ def _is_chain_split_fatal(text):
 def _is_terminus_issue(text):
     return bool(re.search(r"-ter\b", text, re.IGNORECASE))
 
-def _is_local_residue_issue(text):
+def extract_local_residue_info(text):
+    """特定残基に関するFatalエラーから残基名・残基番号を抽出する"""
     patterns = [
-        r"Incomplete ring in (\w+)(\d+)",
+        r"Incomplete ring in ([A-Za-z]+)(\d+)",              # 例: "Incomplete ring in PRO1516"
         r"residue (\w+) (\d+) .* (missing|incomplete|not found)",
-        r"Atom \w+ is missing in residue (\w+) (\d+)"
+        r"Atom \w+ is missing in residue (\w+) (\d+)",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            if "Incomplete ring" in pattern:
-                res_name = match.group(1).upper()
-                res_id = match.group(2)
-            else:
-                res_name = match.group(1).upper()
-                res_id = match.group(2)
-                
-            return True, {"res_name": res_name, "res_id": res_id}
+            return True, {"res_name": match.group(1).upper(), "res_id": match.group(2)}
     return False, {}
 
+def _is_local_residue_issue(text):
+    is_match, _ = extract_local_residue_info(text)
+    return is_match
+
 def _is_local_residue_issue_wrapper(text):
-    is_match, info = _is_local_residue_issue(text)
-    return is_match, info
+    return _is_local_residue_issue(text)
 
 DIAGNOSIS_RULES = [
     ("MISSING_HYDROGEN", _is_missing_hydrogen),
