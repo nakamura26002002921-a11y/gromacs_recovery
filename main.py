@@ -30,6 +30,11 @@ def main():
         sys.exit(1)
 
     initial_pdb = "broken_test.pdb"
+    pdb_id = config.get("rfdiffusion", {}).get("pdb_id")
+    if not pdb_id:
+        logging.error(
+            " 正しいPDB IDをconfig.yamlで明示指定してください。"
+        )
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     work_dir = os.path.join(LOG_DIR, f"work_{timestamp}")
     os.makedirs(work_dir, exist_ok=True)
@@ -39,6 +44,7 @@ def main():
 
     init_state = {
         "pdb_path": initial_pdb,
+        "pdb_id": pdb_id, 
         "work_dir": work_dir,
         "attempt": 0,
         "repair_history": [],
