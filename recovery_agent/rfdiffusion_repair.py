@@ -37,8 +37,16 @@ def _build_contig(fixer):
 
 
 def _load_trb(trb_path):
-    import torch
-    return torch.load(trb_path, map_location="cpu", weights_only=False)
+    # RFdiffusionの.trbファイルは torch.save() ではなく通常の pickle.dump() で保存されるため、
+    # torch.load() (zip/tar形式を前提とするパーサ) では "Invalid magic number; corrupt file?" になる。
+    # まず素のpickleとして読み、失敗した場合のみtorch.loadにフォールバックする。
+    import pickle
+    try:
+        with open(trb_path, "rb") as f:
+            return pickle.load(f)
+    except (pickle.UnpicklingError, EOFError):
+        import torch
+        return torch.load(trb_path, map_location="cpu", weights_only=False)
 
 
 def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
