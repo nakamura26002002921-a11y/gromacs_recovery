@@ -133,21 +133,20 @@ def strip_unknown_residue(pdb_path, step_num, work_dir, missing_residue_name=Non
     return {"op_name": op_name, "new_pdb_path": out_path, "extra_flags": None, "structure_altered": True}
 
 
-def pdbfixer_local_repair(pdb_path, attempt, work_dir, **kwargs):
+def pdbfixer_local_repair(pdb_path, attempt, work_dir, res_name=None, res_id=None, **kwargs):
+    """既存座標は動かさず、エラーが出た残基周辺の欠損原子だけを局所的に補完する"""
+    op_name = "pdbfixer_local_repair"
+    if res_name and res_id:
+        print(f"  -> Targeting local repair for residue: {res_name} {res_id}")
     fixer = PDBFixer(filename=pdb_path)
-    error_info = kwargs.get("error_info", {})
-    if error_info:
-        print(f"  -> Targeting local repair for residue: {error_info.get('res_name')} {error_info.get('res_id')}")
+    # addMissingAtoms() は findMissingResidues()/findMissingAtoms() が設定する
+    # self.missingResidues / self.missingAtoms を前提にしているため、必ず先に呼ぶ必要がある
+    fixer.findMissingResidues()
+    fixer.findMissingAtoms()
     fixer.addMissingAtoms()
     fixer.addMissingHydrogens(7.0)
-    out_path = os.path.join(work_dir, f"local_repaired_attempt_{attempt}.pdb")
-    with open(out_path, 'w') as f:
-        PDBFile.writeFile(fixer.topology, fixer.positions, f)
-    return {
-        "status": "success",
-        "op_name": "pdbfixer_local_repair",
-        "new_pdb_path": out_path
-    }
+    new_pdb_path = _save_fixer_output(fixer, attempt, op_name, work_dir)
+    return {"op_name": op_name, "new_pdb_path": new_pdb_path, "extra_flags": None}
 
 
 
