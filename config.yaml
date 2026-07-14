@@ -12,3 +12,6 @@ rfdiffusion:
   min_residues_for_rfdiffusion: 6   # これ以上の欠損はRFdiffusionへ、1〜5残基はPDBfixerへ
   num_designs: 1
   timeout_sec: 1800
+  pdb_id: null                          # 例: "6XYZ"。
+  reassign_sequence_from_fasta: true    # RCSB FASTAで新規生成残基の配列を再割り当てするか
+  fasta_cache_dir: "cache/fasta"        # ダウンロードしたFASTAのキャッシュ先(任意)
