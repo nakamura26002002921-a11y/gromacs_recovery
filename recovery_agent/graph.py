@@ -17,6 +17,7 @@ from .rfdiffusion_repair import run_rfdiffusion
 
 class RecoveryState(TypedDict, total=False):
     pdb_path: str
+    pdb_id: str
     work_dir: str
     attempt: int
     repair_history: List[str]
@@ -70,7 +71,10 @@ def build_graph(config):
     def rfdiffusion_node(state):
         # run_rfdiffusion()は「新規生成された欠損部分だけ」を元の全原子構造に差し込んだPDBを返すが、
         # その新規部分はバックボーン原子(N,CA,C,O)しか持たないため、側鎖原子を補完する必要がある
-        merged_pdb = run_rfdiffusion(state["pdb_path"], state["work_dir"], rf_config)
+        merged_pdb = run_rfdiffusion(
+            state["pdb_path"], state["work_dir"], rf_config,
+            pdb_id=state.get("pdb_id"),          # ← 追加
+        )
         filled_pdb = _fill_missing_atoms(merged_pdb, state["work_dir"], "rfdiffusion_filled.pdb")
         return {"pdb_path": filled_pdb}
 
