@@ -2,14 +2,12 @@
 import re
 
 def _is_missing_heavy_atom(text):
-    # 例: "the atom CG used in that entry is not found in the input file"
     match = re.search(r"\batom\s+(\w+)\s+used in that entry is not found", text, re.IGNORECASE)
     if match:
         return not match.group(1).upper().startswith("H")
     return False
 
 def _is_missing_hydrogen(text):
-    # 例: "Atom HB3 in residue LYS 3 was not found in rtp entry LYS"
     match = re.search(r"\batom\s+(\w+)\s+in residue\s+\w+\s+\d+\s+was not found in rtp entry", text, re.IGNORECASE)
     if match:
         return match.group(1).upper().startswith("H")
@@ -28,9 +26,8 @@ def _is_terminus_issue(text):
     return bool(re.search(r"-ter\b", text, re.IGNORECASE))
 
 def extract_local_residue_info(text):
-    """特定残基に関するFatalエラーから残基名・残基番号を抽出する"""
     patterns = [
-        r"Incomplete ring in ([A-Za-z]+)(\d+)",              # 例: "Incomplete ring in PRO1516"
+        r"Incomplete ring in ([A-Za-z]+)(\d+)",
         r"residue (\w+) (\d+) .* (missing|incomplete|not found)",
         r"Atom \w+ is missing in residue (\w+) (\d+)",
     ]
@@ -70,11 +67,7 @@ def extract_fatal_error(stderr_text):
 def diagnose_error(stderr_text):
     fatal_section = extract_fatal_error(stderr_text)
     search_target = (fatal_section or stderr_text).replace('\n', ' ')
-
-    matched = [name for name, fn in DIAGNOSIS_RULES if fn(search_target)]
-
-    if len(matched) > 1:
-        return f"AMBIGUOUS({'/'.join(matched)})"
-    if len(matched) == 1:
-        return matched[0]
+    for name, fn in DIAGNOSIS_RULES:
+        if fn(search_target):
+            return name
     return "UNKNOWN"
