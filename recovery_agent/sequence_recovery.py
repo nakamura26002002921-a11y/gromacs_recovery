@@ -2,6 +2,8 @@
 import os
 import re
 import requests
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 from Bio.Align import PairwiseAligner, substitution_matrices
 from Bio.Data.IUPACData import protein_letters_3to1
 
@@ -36,11 +38,7 @@ def fetch_rcsb_fasta(pdb_id, cache_dir=None, timeout=30):
 
 
 def parse_rcsb_fasta(fasta_text):
-    """RCSBのFASTAテキストから 'チェーンID -> アミノ酸配列(1文字)' の対応表を作る。
-    RCSBのFASTAヘッダは ">1AON_1|Chains A, B, C, ...|..." のように、同一配列を
-    共有する複数チェーンをまとめて記載するため、ヘッダの 'Chains X, Y, Z' 部分を
-    パースして該当する全チェーンIDに同じ配列を割り当てる。
-    """
+    """RCSBのFASTAテキストから 'チェーンID -> アミノ酸配列(1文字)' の対応表を作る。"""
     sequences = {}
     header, seq_lines = None, []
 
@@ -89,38 +87,124 @@ def _build_wildcard_aligner():
     return aligner
 
 
-def map_generated_residues_to_sequence(chain_id, orig_chain_residues, generated_resnums, fasta_sequences):
-    """既知残基(1文字)+新規生成残基('X')のテンプレート文字列を作り、FASTA配列と
-    グローバルアラインメントすることで、新規生成位置に対応する本来のアミノ酸を推定する。
-
-    orig_chain_residues: {resnum: "GLY"などの3文字コード, ...} (該当チェーンの現在の全残基)
-    generated_resnums:   RFdiffusionが新規生成した(=本来の配列が不明な)resnumの集合
-    戻り値: {resnum: "ALA"などの正しい3文字コード, ...} (generated_resnumsのみ)
+def find_optimal_chain_mapping(pdb_complex_residues, generated_resnums_dict, fasta_sequences, aligner):
     """
-    if chain_id not in fasta_sequences:
-        return {}
-    target_seq = fasta_sequences[chain_id]
+    MM-alignベースのチェーン割当最適化:
+    PDB構造の全チェーンと、FASTAの全配列の間で総当りのアラインメントスコア行列を計算し、
+    ハンガリー法を用いて全体としてのスコアが最大化する「1対1の最適な対応関係」を解く。
 
-    resnums_sorted = sorted(orig_chain_residues.keys())
-    if not resnums_sorted:
+    pdb_complex_residues: {pdb_chain_id: {resnum: "GLY", ...}, ...}
+    generated_resnums_dict: {pdb_chain_id: {resnum, ...}, ...}
+    fasta_sequences: {fasta_chain_id: "SEQUENCE", ...}
+    """
+    pdb_chain_ids = list(pdb_complex_residues.keys())
+    fasta_chain_ids = list(fasta_sequences.keys())
+
+    if not pdb_chain_ids or not fasta_chain_ids:
         return {}
 
-    template_seq = "".join(
-        "X" if resnum in generated_resnums else _THREE_TO_ONE.get(orig_chain_residues[resnum], "X")
-        for resnum in resnums_sorted
+    # コスト行列の初期化 (行: PDBチェーン, 列: FASTA配列)
+    # scipyの最適化は最小化問題を解くため、アラインメントスコアをマイナスにする
+    cost_matrix = np.zeros((len(pdb_chain_ids), len(fasta_chain_ids)))
+
+    for i, p_cid in enumerate(pdb_chain_ids):
+        orig_residues = pdb_complex_residues[p_cid]
+        gen_resnums = generated_resnums_dict.get(p_cid, set())
+
+        resnums_sorted = sorted(orig_residues.keys())
+        if not resnums_sorted:
+            cost_matrix[i, :] = 0  # 空のチェーンはスコア0
+            continue
+
+        # テンプレート配列（Xを含む）を作成
+        template_seq = "".join(
+            "X" if resnum in gen_resnums else _THREE_TO_ONE.get(orig_residues[resnum], "X")
+            for resnum in resnums_sorted
+        )
+
+        for j, f_cid in enumerate(fasta_chain_ids):
+            target_seq = fasta_sequences[f_cid]
+            # aligner.scoreでアラインメント経路生成をバイパスし高速計算
+            score = aligner.score(template_seq, target_seq)
+            cost_matrix[i, j] = -score
+
+    # ハンガリー法による線形割当の実行
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    # マッピング結果の構築
+    mapping = {}
+    for r, c in zip(row_ind, col_ind):
+        # 必要に応じてここに類似度カットオフ（極端に低いスコアのペアを除外する）を入れることも可能
+        mapping[pdb_chain_ids[r]] = fasta_chain_ids[c]
+
+    return mapping
+
+
+def recover_complex_sequences(pdb_complex_residues, generated_resnums_dict, fasta_sequences):
+    """
+    複合体全体に対してチェーンの対応を最適化し、すべての新規生成残基を同時にリカバリーする。
+
+    pdb_complex_residues: {pdb_chain_id: {resnum: "GLY", ...}, ...}
+    generated_resnums_dict: {pdb_chain_id: {resnum1, ...}, ...}
+    fasta_sequences: {fasta_chain_id: "SEQUENCE", ...}
+    
+    戻り値: {pdb_chain_id: {resnum: "ALA", ...}, ...} (各チェーンの新規生成残基のみの推定結果)
+    """
+    aligner = _build_wildcard_aligner()
+
+    # 1. MM-align的なアプローチでPDBチェーンとFASTA配列の最適な対応を決定
+    mapping = find_optimal_chain_mapping(
+        pdb_complex_residues, generated_resnums_dict, fasta_sequences, aligner
     )
 
-    aligner = _build_wildcard_aligner()
-    alignment = aligner.align(template_seq, target_seq)[0]
-    aligned_template, aligned_target = str(alignment[0]), str(alignment[1])
+    complex_results = {}
 
-    result = {}
-    ti = 0  # template_seq(resnums_sorted)側のインデックス
-    for a_char, b_char in zip(aligned_template, aligned_target):
-        if a_char != "-":
-            if a_char == "X" and b_char not in ("-", "X"):
-                resnum = resnums_sorted[ti]
-                if resnum in generated_resnums:
-                    result[resnum] = _ONE_TO_THREE.get(b_char.upper(), "GLY")
-            ti += 1
-    return result
+    # 2. 決定した最適なマッピングに基づいて各チェーンをアラインメント
+    for p_cid, f_cid in mapping.items():
+        orig_residues = pdb_complex_residues[p_cid]
+        gen_resnums = generated_resnums_dict.get(p_cid, set())
+        target_seq = fasta_sequences[f_cid]
+
+        resnums_sorted = sorted(orig_residues.keys())
+        if not resnums_sorted or not gen_resnums:
+            continue
+
+        template_seq = "".join(
+            "X" if resnum in gen_resnums else _THREE_TO_ONE.get(orig_residues[resnum], "X")
+            for resnum in resnums_sorted
+        )
+
+        alignments = aligner.align(template_seq, target_seq)
+        if not alignments:
+            continue
+        alignment = alignments[0]
+        aligned_template, aligned_target = str(alignment[0]), str(alignment[1])
+
+        chain_result = {}
+        ti = 0  # template_seq(resnums_sorted)側のインデックス
+        for a_char, b_char in zip(aligned_template, aligned_target):
+            if a_char != "-":
+                if a_char == "X" and b_char not in ("-", "X"):
+                    resnum = resnums_sorted[ti]
+                    if resnum in gen_resnums:
+                        chain_result[resnum] = _ONE_TO_THREE.get(b_char.upper(), "GLY")
+                ti += 1
+
+        if chain_result:
+            complex_results[p_cid] = chain_result
+
+    return complex_results
+
+
+def map_generated_residues_to_sequence(chain_id, orig_chain_residues, generated_resnums, fasta_sequences):
+    """
+    （旧APIとの後方互換性用）
+    単一のチェーンIDに対する処理要求であっても、裏側では最適化アルゴリズムを回し、
+    最もアラインメントスコアの高いFASTA配列を自動選択して残基推定を実行する。
+    """
+    # 単一チェーンを複合体用のインターフェースにラップして実行
+    pdb_complex_residues = {chain_id: orig_chain_residues}
+    generated_resnums_dict = {chain_id: generated_resnums}
+
+    results = recover_complex_sequences(pdb_complex_residues, generated_resnums_dict, fasta_sequences)
+    return results.get(chain_id, {})
