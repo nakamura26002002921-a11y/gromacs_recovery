@@ -58,5 +58,6 @@ class ObservationModule:
                 "stderr": f"TIMEOUT: gmx pdb2gmx did not finish in {timeout} seconds",
                 "returncode": -1
             }
+            
         except Exception as e:
             return {"success": False, "stdout": "", "stderr": str(e), "returncode": -1}
