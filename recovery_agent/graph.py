@@ -57,18 +57,25 @@ def build_graph(config):
     def check_missing(state):
         return {"missing_count": count_missing_residues(state["pdb_path"])}
 
-    def rfdiffusion_node(state):
-        new_pdb = run_rfdiffusion(state["pdb_path"], state["work_dir"], rf_config)
-        return {"pdb_path": new_pdb}
-
-    def pdbfixer_node(state):
-        fixer = PDBFixer(filename=state["pdb_path"])
+    def _fill_missing_atoms(pdb_path, work_dir, out_name):
+        fixer = PDBFixer(filename=pdb_path)
         fixer.findMissingResidues()
         fixer.findMissingAtoms()
         fixer.addMissingAtoms()
-        out_path = os.path.join(state["work_dir"], "pdbfixer_filled.pdb")
+        out_path = os.path.join(work_dir, out_name)
         with open(out_path, "w") as f:
             PDBFile.writeFile(fixer.topology, fixer.positions, f)
+        return out_path
+
+    def rfdiffusion_node(state):
+        # run_rfdiffusion()は「新規生成された欠損部分だけ」を元の全原子構造に差し込んだPDBを返すが、
+        # その新規部分はバックボーン原子(N,CA,C,O)しか持たないため、側鎖原子を補完する必要がある
+        merged_pdb = run_rfdiffusion(state["pdb_path"], state["work_dir"], rf_config)
+        filled_pdb = _fill_missing_atoms(merged_pdb, state["work_dir"], "rfdiffusion_filled.pdb")
+        return {"pdb_path": filled_pdb}
+
+    def pdbfixer_node(state):
+        out_path = _fill_missing_atoms(state["pdb_path"], state["work_dir"], "pdbfixer_filled.pdb")
         return {"pdb_path": out_path}
 
     def pdb2gmx_node(state):
