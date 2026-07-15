@@ -4,7 +4,7 @@ import subprocess
 import re
 import pickle
 import numpy as np
-from Bio.PDB import PDBParser, PDBIO, Residue, Atom
+from Bio.PDB import PDBParser, PDBIO, Structure, Model
 from pdbfixer import PDBFixer
 
 from recovery_agent.sequence_recovery import (
@@ -69,177 +69,117 @@ def _get_expected_missing_resnums(fixer):
     return pdb_complex_residues, generated_resnums_dict, missing_regions
 
 
-def _extract_single_chain(complex_pdb_path, target_cid, out_path):
-    """複合体PDBから対象の鎖のみを抽出して保存する"""
-    parser = PDBParser(QUIET=True)
-    struct = parser.get_structure("cpx", complex_pdb_path)
-    
-    for model in struct:
-        chains_to_remove = [chain.id for chain in model if chain.id != target_cid]
-        for cid in chains_to_remove:
-            model.detach_child(cid)
-            
-    io = PDBIO()
-    io.set_structure(struct)
-    io.save(out_path)
-
-
-def _make_dummy_backbone_atoms(ca_coord, direction):
+def _clean_and_extract_chain_pdb(original_pdb_path, target_chain_id, work_dir):
     """
-    CA座標と「鎖が伸びる方向ベクトル」から、縮退しない
-    N, CA, C, O のダミー座標を作る。
-    標準的なバックボーンの結合長・結合角に近い、簡易的な配置。
-    direction はゼロベクトルであってはならない。
-    """
-    direction = direction / (np.linalg.norm(direction) + 1e-8)
-    # directionに垂直な適当なベクトルを作る（縮退しない局所フレームを保証するため）
-    arbitrary = np.array([1.0, 0.0, 0.0])
-    if abs(np.dot(direction, arbitrary)) > 0.9:
-        arbitrary = np.array([0.0, 1.0, 0.0])
-    side = np.cross(direction, arbitrary)
-    side = side / (np.linalg.norm(side) + 1e-8)
-
-    n_coord = ca_coord - direction * 1.46 + side * 0.3
-    c_coord = ca_coord + direction * 1.52 - side * 0.3
-    o_coord = c_coord + direction * 1.0 + side * 0.5
-
-    return n_coord.astype("f"), ca_coord.astype("f"), c_coord.astype("f"), o_coord.astype("f")
-
-
-def _prepare_single_chain_input(chain_pdb_path, cid, corrections, regions, out_path):
-    """単一鎖の欠損部分に、正しいアミノ酸名を持つダミー残基を挿入する。
-
-    【重要】ダミー残基はCA原子1個だけをコピーするのではなく、
-    N, CA, C, O の4原子すべてに、互いに重ならない縮退しない座標を与える。
-    RFdiffusionは各残基のバックボーン原子から局所座標フレーム（回転行列）を
-    計算するため、原子が同一直線上・同一点にあるとフレームが定義できず
-    "Non-positive determinant" エラーで拡散サンプリングが失敗する。
-    ここでは、欠損区間の直前アンカー残基から直後アンカー残基への方向ベクトルに
-    沿って、各ダミー残基のCA座標を少しずつオフセットしながら並べることで、
-    重複しない直線状の初期鎖を作る（RFdiffusionが後で座標そのものを
-    再生成するため、厳密なジオメトリである必要はないが、縮退だけは避ける）。
+    指定された鎖を抽出し、座標異常(NaN/inf)やHETATMを除去してクリーンなPDBを出力する。
+    【追加】SVDエラー(特異行列)を確実に防ぐため、座標に微小なノイズ(Jittering)を加える。
     """
     parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("chain", chain_pdb_path)
+    structure = parser.get_structure("orig", original_pdb_path)
     model = structure[0]
+    
+    if target_chain_id not in model:
+        raise ValueError(f"Chain {target_chain_id} not found in PDB.")
 
-    if cid in model:
-        chain = model[cid]
-        residues = sorted([res for res in chain if res.id[0] == " "], key=lambda r: r.id[1])
-        resnum_to_res = {res.id[1]: res for res in residues}
+    new_struct = Structure.Structure("cleaned")
+    new_model = Model.Model(0)
+    new_chain = model[target_chain_id].copy()
+    
+    valid_resnums = []
+    
+    for res in list(new_chain):
+        # 標準アミノ酸以外(水やHETATM)は除外
+        if res.id[0] != " ":
+            new_chain.detach_child(res.id)
+            continue
+            
+        if "CA" not in res:
+            new_chain.detach_child(res.id)
+            continue
+            
+        # 異常座標(NaN, Inf)のチェック
+        ca_coord = res["CA"].get_coord()
+        if np.any(np.isnan(ca_coord)) or np.any(np.isinf(ca_coord)):
+            new_chain.detach_child(res.id)
+            continue
+            
+        # 【ここが追加ポイント】SVDの収束を安定させるための微小ノイズ (0.0001 Å)
+        for atom in res:
+            coord = atom.get_coord()
+            jitter = np.random.normal(0, 1e-4, 3)
+            atom.set_coord(coord + jitter)
+            
+        valid_resnums.append(res.id[1])
+        
+    if not valid_resnums:
+        raise ValueError(f"No valid residues found in chain {target_chain_id}.")
 
-        for start_res, end_res in regions:
-            # 欠損区間の前後の実在アンカー残基からCA座標を取得
-            before_res = resnum_to_res.get(start_res - 1)
-            after_res = resnum_to_res.get(end_res + 1)
-
-            before_ca = before_res["CA"].coord if (before_res and "CA" in before_res) else None
-            after_ca = after_res["CA"].coord if (after_res and "CA" in after_res) else None
-
-            if before_ca is not None and after_ca is not None:
-                base_coord = np.array(before_ca, dtype=float)
-                direction = np.array(after_ca, dtype=float) - base_coord
-            elif before_ca is not None:
-                base_coord = np.array(before_ca, dtype=float)
-                direction = np.array([1.0, 0.0, 0.0])
-            elif after_ca is not None:
-                base_coord = np.array(after_ca, dtype=float)
-                direction = np.array([-1.0, 0.0, 0.0])
-            else:
-                # アンカーが全く無い（鎖全体が欠損しているような異常系）場合の保険
-                base_coord = np.array([0.0, 0.0, 0.0])
-                direction = np.array([1.0, 0.0, 0.0])
-
-            # 縮退防止のため、方向ベクトルがゼロに近い場合は適当な向きに補正
-            if np.linalg.norm(direction) < 1e-6:
-                direction = np.array([1.0, 0.0, 0.0])
-            direction = direction / np.linalg.norm(direction)
-
-            gap_len = end_res - start_res + 1
-            step = 3.8  # 隣接CA間の標準的な距離[Å]目安
-
-            for i, resnum in enumerate(range(start_res, end_res + 1), start=1):
-                resname = corrections.get(cid, {}).get(resnum, "GLY")
-                new_res = Residue.Residue((" ", resnum, " "), resname, " ")
-
-                ca_coord = base_coord + direction * step * i
-                n_coord, ca_coord, c_coord, o_coord = _make_dummy_backbone_atoms(ca_coord, direction)
-
-                for atom_name, coord in (("N", n_coord), ("CA", ca_coord), ("C", c_coord), ("O", o_coord)):
-                    atom = Atom.Atom(
-                        name=atom_name,
-                        coord=coord,
-                        bfactor=0.0,
-                        occupancy=1.0,
-                        altloc=" ",
-                        fullname=f" {atom_name:<3}",
-                        serial_number=0,
-                        element=atom_name[0],
-                    )
-                    new_res.add(atom)
-
-                chain.add(new_res)
-                resnum_to_res[resnum] = new_res
-
-        chain.child_list.sort(key=lambda r: r.id[1])
-
+    new_model.add(new_chain)
+    new_struct.add(new_model)
+    
+    out_path = os.path.join(work_dir, f"cleaned_chain_{target_chain_id}.pdb")
     io = PDBIO()
-    io.set_structure(structure)
+    io.set_structure(new_struct)
     io.save(out_path)
+    
+    return out_path, sorted(valid_resnums)
 
 
-def _build_args_for_single_chain(prepared_pdb_path, cid, regions, corrections):
-    """単一鎖に対するRFdiffusion引数（contig, inpaint_str, provide_seq）を生成"""
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("prep", prepared_pdb_path)
-    chain = structure[0][cid]
-    
-    residues = [res for res in chain if res.id[0] == " "]
-    if not residues:
-        return "", "", ""
-        
-    start_num = residues[0].id[1]
-    end_num = residues[-1].id[1]
-    
-    # 単一鎖なので結合タグ (/0 ) は不要でシンプル
-    contig = f"{cid}{start_num}-{end_num}"
-    
-    inpaint_str_list = [f"{cid}{start}-{end}" for start, end in regions]
-    inpaint_str = ",".join(inpaint_str_list)
-    
-    provide_seq_indices = []
-    current_idx = 0
-    for res in residues:
-        resnum = res.id[1]
-        is_missing = any(start <= resnum <= end for start, end in regions)
-        if is_missing and cid in corrections and resnum in corrections[cid]:
-            provide_seq_indices.append(current_idx)
-        current_idx += 1
-        
+def _build_optimized_contig_and_seq(valid_resnums, missing_regions, chain_id):
+    """
+    実在する座標ブロックと欠損ブロックを順番に並べ、
+    RFdiffusionに渡す最適化された contig と provide_seq を生成する。
+    """
+    tokens = []
     provide_seq_ranges = []
-    if provide_seq_indices:
-        start = prev = provide_seq_indices[0]
-        for idx in provide_seq_indices[1:]:
-            if idx == prev + 1:
-                prev = idx
+    
+    # 既存の残基を連続したセグメントにまとめる
+    segments = []
+    if valid_resnums:
+        start = prev = valid_resnums[0]
+        for r in valid_resnums[1:]:
+            if r == prev + 1:
+                prev = r
             else:
-                provide_seq_ranges.append(f"{start}-{prev}")
-                start = prev = idx
-        provide_seq_ranges.append(f"{start}-{prev}")
+                segments.append((start, prev))
+                start = prev = r
+        segments.append((start, prev))
+
+    # existing と missing を混ぜて開始インデックスでソート
+    all_blocks = []
+    for s, e in segments:
+        all_blocks.append(('existing', s, e))
+    for s, e in sorted(missing_regions, key=lambda x: x[0]):
+        all_blocks.append(('missing', s, e))
         
+    all_blocks.sort(key=lambda x: x[1])
+    
+    current_out_idx = 0
+    for btype, s, e in all_blocks:
+        if btype == 'existing':
+            tokens.append(f"{chain_id}{s}-{e}")
+            seg_len = e - s + 1
+            provide_seq_ranges.append(f"{current_out_idx}-{current_out_idx + seg_len - 1}")
+            current_out_idx += seg_len
+        elif btype == 'missing':
+            gap_len = e - s + 1
+            tokens.append(f"{gap_len}-{gap_len}")
+            current_out_idx += gap_len
+            
+    contig = ",".join(tokens)
     provide_seq = ",".join(provide_seq_ranges)
     
-    return contig, inpaint_str, provide_seq
+    return contig, provide_seq
 
 
-def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, target_cid, regions, out_path):
+def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, target_cid, regions, corrections, out_path):
     """
     RFdiffusionで生成された単一鎖の新規残基座標を、全体の複合体PDBにマージ（移植）する。
+    同時にFASTA由来の正しいアミノ酸名を割り当てる。
     """
     with open(trb_path, "rb") as f:
         trb = pickle.load(f)
 
-    # .trb から保持された残基を取得
     kept_hal_ids = set(trb.get("con_hal_pdb_idx", []))
 
     parser = PDBParser(QUIET=True)
@@ -252,12 +192,17 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
         for res in chain:
             if res.id[0] != " ":
                 continue
-            if (chain.id, res.id[1]) not in kept_hal_ids:
+            is_kept = False
+            for kept_id in kept_hal_ids:
+                if kept_id[0] == chain.id and kept_id[1] == res.id[1]:
+                    is_kept = True
+                    break
+            if not is_kept:
                 newly_generated_hal_residues.append(res)
 
     # 複合体PDBの挿入先スロットを算出
     expected_missing_slots = []
-    for start_res, end_res in regions:
+    for start_res, end_res in sorted(regions, key=lambda x: x[0]):
         for resnum in range(start_res, end_res + 1):
             expected_missing_slots.append(resnum)
 
@@ -267,7 +212,7 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
             f"but AI generated {len(newly_generated_hal_residues)}."
         )
 
-    # 複合体PDBの対象チェーンへ外科的に移植
+    # 複合体PDBの対象チェーンへ外科的に移植し、正しい残基名を与える
     target_chain = complex_struct[0][target_cid]
     for resnum, hal_res in zip(expected_missing_slots, newly_generated_hal_residues):
         to_detach = [r.id for r in target_chain if r.id[1] == resnum and r.id[0] == " "]
@@ -276,6 +221,11 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
             
         new_res = hal_res.copy()
         new_res.id = (" ", resnum, " ")
+        
+        # FASTAから取得した正しいアミノ酸名を設定
+        correct_resname = corrections.get(target_cid, {}).get(resnum, "GLY")
+        new_res.resname = correct_resname
+        
         target_chain.add(new_res)
         
     target_chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))
@@ -288,18 +238,15 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
 def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
     """
     メイン・エントリポイント。
-    複合体全体から欠損を検知し、欠損のある「鎖ごと」に分割してRFdiffusionを実行・マージする。
     """
     fixer = PDBFixer(filename=pdb_path)
     fixer.findMissingResidues()
 
     pdb_complex_residues, generated_resnums_dict, missing_regions = _get_expected_missing_resnums(fixer)
 
-    # 欠損がない場合はそのまま返す
     if not missing_regions:
         return pdb_path
 
-    # 全体の正解配列マッピングを取得
     complex_corrections = {}
     if pdb_id and rf_config.get("reassign_sequence_from_fasta") and generated_resnums_dict:
         fasta_text = fetch_rcsb_fasta(pdb_id, cache_dir=rf_config.get("fasta_cache_dir"))
@@ -310,37 +257,28 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
             fasta_sequences=fasta_sequences
         )
 
-    # 逐次マージ用のトラッキング変数
     current_complex_pdb = pdb_path
     
-    # 欠損のある鎖ごとにループ処理
     for cid, regions in missing_regions.items():
         print(f"[Info] Processing chain {cid} for missing regions: {regions}")
         
-        # 1. 複合体から対象鎖のみを抽出
-        chain_pdb_path = os.path.join(work_dir, f"temp_chain_{cid}.pdb")
-        _extract_single_chain(current_complex_pdb, cid, chain_pdb_path)
+        # 1. 複合体から対象鎖のみを抽出し、座標異常を除去 + Jittering適用
+        clean_pdb_path, valid_resnums = _clean_and_extract_chain_pdb(current_complex_pdb, cid, work_dir)
         
-        # 2. 欠損部に正しい配列のダミー残基を挿入
-        prep_chain_pdb = os.path.join(work_dir, f"prep_chain_{cid}.pdb")
-        _prepare_single_chain_input(chain_pdb_path, cid, complex_corrections, regions, prep_chain_pdb)
+        # 2. 最適化されたcontigとprovide_seqの作成
+        contig, provide_seq = _build_optimized_contig_and_seq(valid_resnums, regions, cid)
+        print(f"[Info] Optimized contig for chain {cid}: {contig}")
         
         # 3. 引数の構築
-        contig, inpaint_str, provide_seq = _build_args_for_single_chain(
-            prep_chain_pdb, cid, regions, complex_corrections
-        )
-        
         out_prefix = os.path.join(work_dir, f"rf_out_chain_{cid}")
         cmd = [
             "python", rf_config["script_path"],
             f"inference.output_prefix={out_prefix}",
-            f"inference.input_pdb={os.path.abspath(prep_chain_pdb)}",
+            f"inference.input_pdb={os.path.abspath(clean_pdb_path)}",
             f"inference.model_directory_path={rf_config['model_directory_path']}",
             f"contigmap.contigs=[{contig}]",
             f"inference.num_designs={rf_config.get('num_designs', 1)}",
         ]
-        if inpaint_str:
-            cmd.append(f"contigmap.inpaint_str=[{inpaint_str}]")
         if provide_seq:
             cmd.append(f"contigmap.provide_seq=[{provide_seq}]")
             
@@ -350,18 +288,21 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
             cwd=work_dir, timeout=rf_config.get("timeout_sec", 1800)
         )
         if result.returncode != 0:
-            raise RuntimeError(f"RFdiffusion failed on chain {cid}: {result.stderr[-2000:]}")
+            print(f"[Error] RFdiffusion stderr:\n{result.stderr[-2000:]}")
+            raise RuntimeError(f"RFdiffusion failed on chain {cid}. Check logs.")
             
         hal_pdb_path = f"{out_prefix}_0.pdb"
         trb_path = f"{out_prefix}_0.trb"
         
-        # 4. 修復された鎖の一部（新規残基）を、複合体PDBにマージ
+        if not os.path.exists(hal_pdb_path) or not os.path.exists(trb_path):
+            raise RuntimeError(f"RFdiffusion output files missing for chain {cid}")
+        
+        # 4. 修復された鎖の一部（新規残基）を、複合体PDBにマージ (正解配列もここで反映)
         next_complex_pdb = os.path.join(work_dir, f"merged_step_chain_{cid}.pdb")
         _merge_single_chain_to_complex(
-            current_complex_pdb, hal_pdb_path, trb_path, cid, regions, next_complex_pdb
+            current_complex_pdb, hal_pdb_path, trb_path, cid, regions, complex_corrections, next_complex_pdb
         )
         
-        # 次のループへマージ済みPDBを引き継ぐ
         current_complex_pdb = next_complex_pdb
 
     final_out_path = os.path.join(work_dir, "rfdiffusion_final_merged.pdb")
