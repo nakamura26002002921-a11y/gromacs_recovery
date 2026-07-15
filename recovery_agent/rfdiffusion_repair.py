@@ -105,7 +105,16 @@ def _prepare_input_pdb_with_correct_sequence(pdb_path, corrections, missing_regi
 
 
 def _build_contig_from_prepared_pdb(pdb_path):
-    """ダミー補完済みPDBから全チェーンをマッピングするcontigを生成（マルチチェーンは/0/で結合）"""
+    """ダミー補完済みPDBから全チェーンをマッピングするcontigを生成。
+
+    RFdiffusionのcontig記法では、
+      - "/" は同一出力チェーン内でセグメントを連結する区切り（例: A2-100/10-10/A111-200 のような1本のchain内のギャップ表現）
+      - "," は独立した別々の出力チェーンを区切る記法
+    である。マルチチェーンの複合体（A, B, C, ... の各チェーンをそれぞれ
+    別チェーンとしてRFdiffusionに渡したい場合）は "," で連結しなければならない。
+    誤って "/0/" で連結すると、全チェーンが1本のchainとして扱われてしまい、
+    "Multiple chain IDs in chain" のようなアサーションエラーになる。
+    """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("prep", pdb_path)
     chain_groups = []
@@ -119,8 +128,8 @@ def _build_contig_from_prepared_pdb(pdb_path):
         end_num = residues[-1].id[1]
         chain_groups.append(f"{cid}{start_num}-{end_num}")
         
-    # 【重要】RFdiffusionで複数チェーンを結合する正しい記法
-    return "/0/".join(chain_groups)
+    # 【重要】RFdiffusionで複数チェーンを独立したchainとして扱わせる正しい記法はカンマ区切り
+    return ",".join(chain_groups)
 
 
 def _get_provide_seq_ranges(pdb_path, missing_regions):
@@ -228,7 +237,7 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
         pdb_path, complex_corrections, missing_regions, work_dir
     )
 
-    # 2. ダミー残基ごと全チェーンをマッピングする contig を構築（例: A1-100/0/B1-50）
+    # 2. ダミー残基ごと全チェーンをマッピングする contig を構築（例: A1-100,B1-50）
     contig = _build_contig_from_prepared_pdb(input_pdb_for_rfdiffusion)
     
     # 3. ダミー残基部分の「座標」を再生成させるための inpaint_str の構築
