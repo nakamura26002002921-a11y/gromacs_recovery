@@ -3,6 +3,7 @@ import os
 import subprocess
 import re
 from Bio.PDB import PDBParser, PDBIO, Residue
+from Bio.PDB.NeighborSearch import NeighborSearch
 from pdbfixer import PDBFixer
 
 from recovery_agent.sequence_recovery import (
@@ -104,32 +105,169 @@ def _prepare_input_pdb_with_correct_sequence(pdb_path, corrections, missing_regi
     return out_path
 
 
-def _build_contig_from_prepared_pdb(pdb_path):
-    """ダミー補完済みPDBから全チェーンをマッピングするcontigを生成。
+def _get_anchor_atoms(model, missing_regions, padding=10):
+    """
+    各欠損チェーンについて、欠損区間の直前・直後にある「実在する」残基
+    （アンカー残基）の原子を集める。空間的近傍探索の基準点として使う。
+    padding: アンカーとして採用する、欠損区間の前後何残基分を見るか。
+    """
+    anchor_atoms = []
+    for chain in model:
+        cid = chain.id
+        if cid not in missing_regions:
+            continue
+        residues_sorted = sorted(
+            (res for res in chain if res.id[0] == " "), key=lambda r: r.id[1]
+        )
+        resnum_to_res = {res.id[1]: res for res in residues_sorted}
+        resnums_sorted = [res.id[1] for res in residues_sorted]
+
+        for start_res, end_res in missing_regions[cid]:
+            # 欠損区間の直前 padding 残基
+            before = [r for r in resnums_sorted if r < start_res][-padding:]
+            # 欠損区間の直後 padding 残基
+            after = [r for r in resnums_sorted if r > end_res][:padding]
+            for resnum in before + after:
+                res = resnum_to_res.get(resnum)
+                if res is not None:
+                    anchor_atoms.extend(res.get_atoms())
+    return anchor_atoms
+
+
+def _select_context_resnums(model, missing_regions, anchor_atoms, radius=15.0):
+    """
+    アンカー原子から radius [Å] 以内に原子を持つ残基を「保持すべき近傍残基」として
+    チェーンごとに resnum の集合で返す。欠損チェーン自身の全残基は無条件で含める
+    （欠損チェーンはそのままRFdiffusionのmotif/生成対象として渡すため）。
+    """
+    ns = NeighborSearch(anchor_atoms)
+    keep_resnums = {}  # cid -> set(resnum)
+
+    for chain in model:
+        cid = chain.id
+        keep_resnums.setdefault(cid, set())
+        if cid in missing_regions:
+            # 欠損チェーンは丸ごと保持（ダミー残基込みで後段のcontigに使うため）
+            for res in chain:
+                if res.id[0] == " ":
+                    keep_resnums[cid].add(res.id[1])
+            continue
+
+        for res in chain:
+            if res.id[0] != " ":
+                continue
+            for atom in res:
+                nearby = ns.search(atom.coord, radius)
+                if nearby:
+                    keep_resnums[cid].add(res.id[1])
+                    break
+
+    return keep_resnums
+
+
+def _resnums_to_contig_ranges(resnums_sorted):
+    """昇順resnumのリストを、連続区間の [(start, end), ...] に圧縮する。"""
+    if not resnums_sorted:
+        return []
+    ranges = []
+    start = prev = resnums_sorted[0]
+    for n in resnums_sorted[1:]:
+        if n == prev + 1:
+            prev = n
+        else:
+            ranges.append((start, prev))
+            start = prev = n
+    ranges.append((start, prev))
+    return ranges
+
+
+def _build_truncated_pdb(pdb_path, missing_regions, work_dir, padding=10, radius=15.0):
+    """
+    欠損チェーンはそのまま保持しつつ、欠損のないチェーンについては
+    欠損部アンカー残基から radius [Å] 以内にある残基だけを残した
+    「トランケーション済みPDB」を作る。RFdiffusionへの入力サイズ
+    （＝GPUメモリ使用量、O(N^2)でスケールする）を大幅に削減するための処理。
+
+    戻り値:
+        truncated_pdb_path: トランケーション後のPDBファイルパス
+        context_ranges: {chain_id: [(start, end), ...]} 各チェーンで
+            保持された連続区間のリスト（contig構築・fixed領域指定に使う）
+    """
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("full", pdb_path)
+    model = structure[0]
+
+    anchor_atoms = _get_anchor_atoms(model, missing_regions, padding=padding)
+    keep_resnums = _select_context_resnums(model, missing_regions, anchor_atoms, radius=radius)
+
+    context_ranges = {}
+    for chain in list(model):
+        cid = chain.id
+        keep = keep_resnums.get(cid, set())
+        # 保持対象外の残基を削除
+        to_remove = [res.id for res in chain if res.id[0] == " " and res.id[1] not in keep]
+        for rid in to_remove:
+            chain.detach_child(rid)
+
+        remaining_resnums = sorted(res.id[1] for res in chain if res.id[0] == " ")
+        if cid not in missing_regions:
+            # コンテキスト鎖の場合のみ、後でcontigに使う連続区間を記録
+            context_ranges[cid] = _resnums_to_contig_ranges(remaining_resnums)
+
+        if not remaining_resnums:
+            model.detach_child(chain.id)
+
+    out_path = os.path.join(work_dir, "rfdiffusion_input_truncated.pdb")
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(out_path)
+    return out_path, context_ranges
+
+
+def _build_contig(truncated_pdb_path, missing_regions, context_ranges):
+    """トランケーション済みPDBから全チェーンをマッピングするcontigを生成。
 
     RFdiffusionのcontig記法（公式ドキュメント/実例に基づく）:
-      - "/" はセグメントの連結（同一の入力チェーン内の断片をつなぐ場合や、
-        直後に "0" を置いて "chain break" を表す場合に使う）。
+      - "/" はセグメントの連結。同一チェーン内で複数の断片（歯抜け区間）を
+        つなぐ場合や、直後に "0" を置いて "chain break" を表す場合に使う。
       - 複数の入力チェーンをそれぞれ独立した出力チェーンとして扱わせたい場合は、
         各チェーンのブロックの間に "/0 "（スラッシュ0 + 半角スペース）を挟む。
         例: "A2-525/0 B2-525/0 C2-525" のように、チェーンの区切りは
         カンマではなく "/0 "(chain-break + スペース) である。
       - カンマ(,)はcontigsのチェーン区切りには使わない
         （provide_seq / inpaint_str など、範囲のリストを列挙する引数の区切りとして使う）。
+
+    トランケーション（空間的近傍抽出）によりコンテキスト鎖が歯抜けになる
+    ことがあるため、各チェーンを単一の start-end ではなく、
+    context_ranges（コンテキスト鎖）/ missing_regions（欠損チェーン、
+    ダミー残基を挟んだ連続範囲）に基づく複数区間として組み立てる。
     """
     parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("prep", pdb_path)
+    structure = parser.get_structure("prep", truncated_pdb_path)
+    model = structure[0]
+
     chain_groups = []
-    
-    for chain in structure[0]:
+    for chain in model:
+        cid = chain.id
         residues = [res for res in chain if res.id[0] == " "]
         if not residues:
             continue
-        cid = chain.id
-        start_num = residues[0].id[1]
-        end_num = residues[-1].id[1]
-        chain_groups.append(f"{cid}{start_num}-{end_num}")
-        
+
+        if cid in missing_regions:
+            # 欠損チェーン: ダミー残基込みで実在する残基は連続しているはずなので
+            # 単純に最初-最後の範囲でよい（トランケーションで削っていない）
+            start_num = residues[0].id[1]
+            end_num = residues[-1].id[1]
+            chain_groups.append(f"{cid}{start_num}-{end_num}")
+        else:
+            # コンテキスト鎖: トランケーションで歯抜けになった区間を
+            # "/" でつないだ1つのcontigブロックとして表現する
+            ranges = context_ranges.get(cid) or []
+            if not ranges:
+                continue
+            segment = "/".join(f"{cid}{s}-{e}" for s, e in ranges)
+            chain_groups.append(segment)
+
     # 【重要】RFdiffusionでチェーンを独立させる正しい記法は "/0 "(スラッシュ0+スペース)
     return "/0 ".join(chain_groups)
 
@@ -284,15 +422,30 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
     else:
         complex_corrections = {}
 
-    # 1. 欠損部に正しい配列を持つダミー残基を挿入（入力配列の固定）
-    input_pdb_for_rfdiffusion = _prepare_input_pdb_with_correct_sequence(
+    # 1. 欠損部に正しい配列を持つダミー残基を挿入（入力配列の固定）。
+    #    このフルサイズPDBは、後段の座標マージの「差し戻し先」として使う。
+    full_pdb_with_dummy = _prepare_input_pdb_with_correct_sequence(
         pdb_path, complex_corrections, missing_regions, work_dir
     )
 
-    # 2. ダミー残基ごと全チェーンをマッピングする contig を構築（例: A1-100/0 B1-50）
-    contig = _build_contig_from_prepared_pdb(input_pdb_for_rfdiffusion)
-    
-    # 3. ダミー残基部分の「座標」を再生成させるための inpaint_str の構築
+    # 2. 空間的トランケーション: 欠損チェーンはそのまま保持し、欠損のない
+    #    コンテキスト鎖は欠損部アンカー残基の近傍だけを残す。
+    #    RFdiffusionはO(N^2)でGPUメモリを消費するため、数千残基級の複合体を
+    #    まるごと渡すとCUDA OOMになる。近傍だけに絞ることで計算量を削減しつつ、
+    #    構造予測に必要な周辺の相互作用情報は維持する。
+    truncation_cfg = rf_config.get("truncation", {})
+    anchor_padding = truncation_cfg.get("anchor_padding_residues", 10)
+    context_radius = truncation_cfg.get("context_radius_angstrom", 15.0)
+
+    truncated_pdb, context_ranges = _build_truncated_pdb(
+        full_pdb_with_dummy, missing_regions, work_dir,
+        padding=anchor_padding, radius=context_radius,
+    )
+
+    # 3. トランケーション後のPDBに基づいて contig を構築
+    contig = _build_contig(truncated_pdb, missing_regions, context_ranges)
+
+    # 4. ダミー残基部分の「座標」を再生成させるための inpaint_str の構築
     inpaint_str_list = []
     for cid, regions in missing_regions.items():
         if cid not in complex_corrections:
@@ -300,14 +453,15 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
         for start_res, end_res in regions:
             inpaint_str_list.append(f"{cid}{start_res}-{end_res}")
 
-    # 4. ダミー残基部分の「配列（正しいアミノ酸）」を維持するための provide_seq (0始まりインデックス)
-    provide_seq_ranges = _get_provide_seq_ranges(input_pdb_for_rfdiffusion, missing_regions)
+    # 5. ダミー残基部分の「配列（正しいアミノ酸）」を維持するための provide_seq
+    #    (トランケーション後PDB全体を通した0始まりインデックス)
+    provide_seq_ranges = _get_provide_seq_ranges(truncated_pdb, missing_regions)
 
     out_prefix = os.path.join(work_dir, "rfdiffusion_out")
     cmd = [
         "python", rf_config["script_path"],
         f"inference.output_prefix={out_prefix}",
-        f"inference.input_pdb={os.path.abspath(input_pdb_for_rfdiffusion)}",
+        f"inference.input_pdb={os.path.abspath(truncated_pdb)}",
         f"inference.model_directory_path={rf_config['model_directory_path']}",
         f"contigmap.contigs=[{contig}]",
         f"inference.num_designs={rf_config.get('num_designs', 1)}",
@@ -336,9 +490,12 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
 
     # .trb ファイルの con_hal_pdb_idx を使い、「新規生成された残基」を
     # チェーンIDに依存せず特定してマージする（RFdiffusionは出力側で
-    # チェーンを統合・再編成することがあるため、chain idでの突き合わせは不可）
+    # チェーンを統合・再編成することがあるため、chain idでの突き合わせは不可）。
+    # マージ先はトランケーション前のフルサイズPDB
+    # （full_pdb_with_dummy）にすることで、削っていたコンテキスト鎖の
+    # 残りの部分（近傍外の残基）を最終出力に残す。
     merged_path = _merge_designed_region(
-        input_pdb_for_rfdiffusion, hal_pdb_path, trb_path, missing_regions, work_dir
+        full_pdb_with_dummy, hal_pdb_path, trb_path, missing_regions, work_dir
     )
 
     return merged_path
