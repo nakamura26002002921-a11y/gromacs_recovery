@@ -39,16 +39,13 @@ graph TD
 
 ---
 
-## 🧠 理論的背景：堅牢な復元を支える2つのアルゴリズム
+### 🧠 理論的背景：堅牢な復元を支える2つのアルゴリズム
+本エージェントが「PDBとFASTAで鎖の順番やIDが異なっていても正しく復元できる」理由は、以下の2つのアルゴリズムの概念を応用しているためです。
+#### 1. MM-align 的思想によるグローバルな配列マッピング
+引用論文: Mukherjee & Zhang, "MM-align: a quick algorithm for aligning multiple-chain protein complex structures using iterative dynamic programming", Nucleic Acids Research, 2009.
+マルチチェーン複合体において、PDBの鎖IDとFASTAの鎖IDが一致しない場合でも、「複合体全体のアライメントスコアの総和」が最大となる1対1の鎖マッピングをハンガリー法で探索します。これにより、鎖の順序が入れ替わっていても、配列パターンに基づいて数学的に最適な対応関係を自動で見つけ出し、欠損領域に入るべき正しいアミノ酸配列を事前に特定します。
 
-本エージェントが「PDBとFASTAで鎖の順番やIDが異なっていても正しく復元できる」理由と、「RFdiffusionが出力したGLYの羅列を正しい配列に戻せる」理由は、以下の2つのアルゴリズムの概念を応用しているためです。
-
-### 1. MM-align 的思想によるグローバルな配列マッピング
-**引用論文:** Mukherjee & Zhang, *"MM-align: a quick algorithm for aligning multiple-chain protein complex structures using iterative dynamic programming"*, Nucleic Acids Research, 2009.
-
-マルチチェーン複合体において、PDBの鎖IDとFASTAの鎖IDが一致しない場合でも、**「複合体全体のアライメントスコアの総和」が最大となる1対1の鎖マッピング**をハンガリー法（`scipy.optimize.linear_sum_assignment`）で探索します。これにより、鎖の順序が入れ替わっていても、配列パターンに基づいて数学的に最適な対応関係を自動で見つけ出し、欠損領域（`X`）に正しいアミノ酸を割り当てます。
-
-#### 📊 MM-align のアルゴリズムフロー
+📊 MM-align のアルゴリズムフロー
 ```mermaid
 graph TD
     A[入力: ターゲット複合体構造 T と モデル構造 M] --> B[初期化: 鎖長の一致や配列類似度に基づく初期の鎖マッピング π を仮定]
@@ -66,12 +63,11 @@ graph TD
     style H fill:#ff9,stroke:#333,stroke-width:2px
 ```
 
-### 2. RFdiffusion の条件付き生成と投影 (Projection)
-**引用論文:** Watson et al., *"De novo design of protein structure and function with RFdiffusion"*, Nature, 2023.
+#### 2. RFdiffusion の配列条件付き生成 (Sequence-Conditioned Inpainting)
+引用論文: Watson et al., "De novo design of protein structure and function with RFdiffusion", Nature, 2023.
+特定された配列情報を RFdiffusion の contigmap.provide_seq オプションに渡すことで、「ランダムなGLY生成」ではなく、「指定されたアミノ酸配列が立体化学的に最も安定する構造」 を直接生成させます。これにより、後処理での配列書き換えというハックを排除し、物理的に妥当性の高い修復を実現します。
 
-RFdiffusion は拡散モデルの「ノイズ予測の平均二乗誤差（MSE）」を最小化するように訓練されています。本エージェントでは、**Inpainting（部分補完）** モードを使用し、既存の残基座標を固定（Conditioning）した状態で未知領域のみをノイズから生成させます。特に `contigmap.provide_seq` を用いることで、FASTAから復元した正しいアミノ酸配列を条件として与え、物理的に妥当なバックボーン構造を生成します。
-
-#### 📊 RFdiffusion の生成アルゴリズムフロー
+📊 RFdiffusion の生成アルゴリズムフロー
 ```mermaid
 graph TD
     A[開始: 純粋なガウスノイズ構造 x_T の生成] --> B{条件付け Conditioning の適用}
