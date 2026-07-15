@@ -3,7 +3,8 @@ import os
 import subprocess
 import re
 import pickle
-from Bio.PDB import PDBParser, PDBIO, Residue
+import numpy as np
+from Bio.PDB import PDBParser, PDBIO, Residue, Atom
 from pdbfixer import PDBFixer
 
 from recovery_agent.sequence_recovery import (
@@ -83,34 +84,105 @@ def _extract_single_chain(complex_pdb_path, target_cid, out_path):
     io.save(out_path)
 
 
+def _make_dummy_backbone_atoms(ca_coord, direction):
+    """
+    CA座標と「鎖が伸びる方向ベクトル」から、縮退しない
+    N, CA, C, O のダミー座標を作る。
+    標準的なバックボーンの結合長・結合角に近い、簡易的な配置。
+    direction はゼロベクトルであってはならない。
+    """
+    direction = direction / (np.linalg.norm(direction) + 1e-8)
+    # directionに垂直な適当なベクトルを作る（縮退しない局所フレームを保証するため）
+    arbitrary = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(direction, arbitrary)) > 0.9:
+        arbitrary = np.array([0.0, 1.0, 0.0])
+    side = np.cross(direction, arbitrary)
+    side = side / (np.linalg.norm(side) + 1e-8)
+
+    n_coord = ca_coord - direction * 1.46 + side * 0.3
+    c_coord = ca_coord + direction * 1.52 - side * 0.3
+    o_coord = c_coord + direction * 1.0 + side * 0.5
+
+    return n_coord.astype("f"), ca_coord.astype("f"), c_coord.astype("f"), o_coord.astype("f")
+
+
 def _prepare_single_chain_input(chain_pdb_path, cid, corrections, regions, out_path):
-    """単一鎖の欠損部分に、正しいアミノ酸名を持つダミー残基を挿入する"""
+    """単一鎖の欠損部分に、正しいアミノ酸名を持つダミー残基を挿入する。
+
+    【重要】ダミー残基はCA原子1個だけをコピーするのではなく、
+    N, CA, C, O の4原子すべてに、互いに重ならない縮退しない座標を与える。
+    RFdiffusionは各残基のバックボーン原子から局所座標フレーム（回転行列）を
+    計算するため、原子が同一直線上・同一点にあるとフレームが定義できず
+    "Non-positive determinant" エラーで拡散サンプリングが失敗する。
+    ここでは、欠損区間の直前アンカー残基から直後アンカー残基への方向ベクトルに
+    沿って、各ダミー残基のCA座標を少しずつオフセットしながら並べることで、
+    重複しない直線状の初期鎖を作る（RFdiffusionが後で座標そのものを
+    再生成するため、厳密なジオメトリである必要はないが、縮退だけは避ける）。
+    """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("chain", chain_pdb_path)
     model = structure[0]
-    
+
     if cid in model:
         chain = model[cid]
         residues = sorted([res for res in chain if res.id[0] == " "], key=lambda r: r.id[1])
-        
+        resnum_to_res = {res.id[1]: res for res in residues}
+
         for start_res, end_res in regions:
-            for resnum in range(start_res, end_res + 1):
+            # 欠損区間の前後の実在アンカー残基からCA座標を取得
+            before_res = resnum_to_res.get(start_res - 1)
+            after_res = resnum_to_res.get(end_res + 1)
+
+            before_ca = before_res["CA"].coord if (before_res and "CA" in before_res) else None
+            after_ca = after_res["CA"].coord if (after_res and "CA" in after_res) else None
+
+            if before_ca is not None and after_ca is not None:
+                base_coord = np.array(before_ca, dtype=float)
+                direction = np.array(after_ca, dtype=float) - base_coord
+            elif before_ca is not None:
+                base_coord = np.array(before_ca, dtype=float)
+                direction = np.array([1.0, 0.0, 0.0])
+            elif after_ca is not None:
+                base_coord = np.array(after_ca, dtype=float)
+                direction = np.array([-1.0, 0.0, 0.0])
+            else:
+                # アンカーが全く無い（鎖全体が欠損しているような異常系）場合の保険
+                base_coord = np.array([0.0, 0.0, 0.0])
+                direction = np.array([1.0, 0.0, 0.0])
+
+            # 縮退防止のため、方向ベクトルがゼロに近い場合は適当な向きに補正
+            if np.linalg.norm(direction) < 1e-6:
+                direction = np.array([1.0, 0.0, 0.0])
+            direction = direction / np.linalg.norm(direction)
+
+            gap_len = end_res - start_res + 1
+            step = 3.8  # 隣接CA間の標準的な距離[Å]目安
+
+            for i, resnum in enumerate(range(start_res, end_res + 1), start=1):
                 resname = corrections.get(cid, {}).get(resnum, "GLY")
                 new_res = Residue.Residue((" ", resnum, " "), resname, " ")
-                
-                # 直前の残基からCA座標をコピー（ダミー用）
-                if residues:
-                    prev_res = residues[-1]
-                    if "CA" in prev_res:
-                        new_res.add(prev_res["CA"].copy())
-                    else:
-                        for atom in prev_res:
-                            new_res.add(atom.copy())
+
+                ca_coord = base_coord + direction * step * i
+                n_coord, ca_coord, c_coord, o_coord = _make_dummy_backbone_atoms(ca_coord, direction)
+
+                for atom_name, coord in (("N", n_coord), ("CA", ca_coord), ("C", c_coord), ("O", o_coord)):
+                    atom = Atom.Atom(
+                        name=atom_name,
+                        coord=coord,
+                        bfactor=0.0,
+                        occupancy=1.0,
+                        altloc=" ",
+                        fullname=f" {atom_name:<3}",
+                        serial_number=0,
+                        element=atom_name[0],
+                    )
+                    new_res.add(atom)
+
                 chain.add(new_res)
-                residues.append(new_res)
-                
+                resnum_to_res[resnum] = new_res
+
         chain.child_list.sort(key=lambda r: r.id[1])
-        
+
     io = PDBIO()
     io.set_structure(structure)
     io.save(out_path)
