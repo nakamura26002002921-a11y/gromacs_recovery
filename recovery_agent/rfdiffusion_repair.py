@@ -1,13 +1,10 @@
 # recovery_agent/rfdiffusion_repair.py
 import os
 import subprocess
-import pickle
 import re
-import json
-from Bio.PDB import PDBParser, PDBIO
+from Bio.PDB import PDBParser, PDBIO, Residue
 from pdbfixer import PDBFixer
 
-# sequence_recovery.py から配列復元に必要なモジュールをインポート
 from recovery_agent.sequence_recovery import (
     fetch_rcsb_fasta, 
     parse_rcsb_fasta, 
@@ -17,53 +14,52 @@ from recovery_agent.sequence_recovery import (
 
 
 def _parse_resnum(res_id):
-    """'100A' や '-1' のようなPDB残基IDから整数部分のみを抽出する（挿入コード対策）"""
+    """'100A' や '-1' のようなPDB残基IDから整数部分のみを抽出する"""
     m = re.search(r'-?\d+', str(res_id))
     return int(m.group()) if m else 0
 
 
 def _get_expected_missing_resnums(fixer):
-    """
-    PDBFixerの情報から、追加されるべき残基の「予想残基番号」と「既存残基辞書」を抽出する。
-    これにより、RFdiffusion実行前にFASTAとの配列マッピングが可能になる。
-    """
+    """PDBFixerから正確な欠損数と位置を取得する"""
     pdb_complex_residues = {}
     generated_resnums_dict = {}
-    missing_regions = {}  # chain_id -> [(start_resnum, end_resnum), ...] (provide_seq構築用)
+    missing_regions = {}
 
     for chain in fixer.topology.chains():
+        cid = chain.id
         residues = list(chain.residues())
         if not residues:
             continue
-        cid = chain.id
         pdb_complex_residues[cid] = {}
         for res in residues:
-            resnum = _parse_resnum(res.id)
-            pdb_complex_residues[cid][resnum] = res.name
+            pdb_complex_residues[cid][_parse_resnum(res.id)] = res.name
 
+    for chain in fixer.topology.chains():
+        cid = chain.id
+        residues = list(chain.residues())
+        
         gaps = sorted(
             ((pos, names) for (ci, pos), names in fixer.missingResidues.items() if ci == chain.index),
             key=lambda x: x[0],
         )
-
+        
         gen_resnums = set()
         regions = []
+
         for pos, names in gaps:
             gap_len = len(names)
             if pos == 0:
-                # 先頭が欠損の場合、既存の最初の残基から逆算
-                next_resnum = _parse_resnum(residues[0].id)
-                start = next_resnum - gap_len
+                start = _parse_resnum(residues[0].id) - gap_len
             else:
-                # 途中の欠損の場合、直前の残基番号から連番で振る
                 prev_resnum = _parse_resnum(residues[pos - 1].id)
                 start = prev_resnum + 1
-
+                
             end = start + gap_len - 1
             regions.append((start, end))
-            for offset in range(gap_len):
-                gen_resnums.add(start + offset)
-
+            
+            for resnum in range(start, end + 1):
+                gen_resnums.add(resnum)
+                
         if gen_resnums:
             generated_resnums_dict[cid] = gen_resnums
             missing_regions[cid] = regions
@@ -71,113 +67,134 @@ def _get_expected_missing_resnums(fixer):
     return pdb_complex_residues, generated_resnums_dict, missing_regions
 
 
-def _build_contig(fixer):
-    """RFdiffusion用のcontig文字列を作る。1鎖に欠損が複数箇所あっても正しく扱う。"""
+def _prepare_input_pdb_with_correct_sequence(pdb_path, corrections, missing_regions, work_dir):
+    """欠損部分に正しいアミノ酸名を持つダミー残基（CAのみ）を挿入した完全なPDBを生成する"""
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("orig", pdb_path)
+    model = structure[0]
+    
+    for cid, regions in missing_regions.items():
+        if cid not in model or cid not in corrections:
+            continue
+        chain = model[cid]
+        residues = sorted([res for res in chain if res.id[0] == " "], key=lambda r: r.id[1])
+        
+        for start_res, end_res in regions:
+            for resnum in range(start_res, end_res + 1):
+                resname = corrections[cid].get(resnum, "GLY")
+                new_res = Residue.Residue((" ", resnum, " "), resname, " ")
+                
+                # ダミー座標として既存の残基から座標をコピー（後でRFdiffusionが再生成するためダミーでよい）
+                if residues:
+                    prev_res = residues[-1]
+                    if "CA" in prev_res:
+                        new_res.add(prev_res["CA"].copy())
+                    else:
+                        for atom in prev_res:
+                            new_res.add(atom.copy())
+                chain.add(new_res)
+                residues.append(new_res)
+                
+        chain.child_list.sort(key=lambda r: r.id[1])
+        
+    out_path = os.path.join(work_dir, "rfdiffusion_input_seq_corrected.pdb")
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(out_path)
+    return out_path
+
+
+def _build_contig_from_prepared_pdb(pdb_path):
+    """ダミー補完済みPDBから全チェーンをマッピングするcontigを生成（マルチチェーンは/0/で結合）"""
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("prep", pdb_path)
     chain_groups = []
-    for chain in fixer.topology.chains():
-        residues = list(chain.residues())
+    
+    for chain in structure[0]:
+        residues = [res for res in chain if res.id[0] == " "]
         if not residues:
             continue
         cid = chain.id
-        start_num, end_num = _parse_resnum(residues[0].id), _parse_resnum(residues[-1].id)
-
-        gaps = sorted(
-            ((pos, names) for (ci, pos), names in fixer.missingResidues.items() if ci == chain.index),
-            key=lambda x: x[0],
-        )
-        if not gaps:
-            chain_groups.append([f"{cid}{start_num}-{end_num}"])
-            continue
-
-        tokens = []
-        cursor = 0
-        seg_start_num = start_num
-        for pos, names in gaps:
-            gap_len = len(names)
-            if pos == 0:
-                tokens.append(f"{gap_len}-{gap_len}")
-                cursor = 0
-                continue
-            if cursor < pos:
-                seg_end_num = _parse_resnum(residues[pos - 1].id)
-                tokens.append(f"{cid}{seg_start_num}-{seg_end_num}")
-            tokens.append(f"{gap_len}-{gap_len}")
-            cursor = pos
-            seg_start_num = _parse_resnum(residues[pos].id) if pos < len(residues) else None
-        if cursor < len(residues) and seg_start_num is not None:
-            tokens.append(f"{cid}{seg_start_num}-{end_num}")
-
-        chain_groups.append(tokens)
-    return ",".join("/".join(group) for group in chain_groups)
+        start_num = residues[0].id[1]
+        end_num = residues[-1].id[1]
+        chain_groups.append(f"{cid}{start_num}-{end_num}")
+        
+    # 【重要】RFdiffusionで複数チェーンを結合する正しい記法
+    return "/0/".join(chain_groups)
 
 
-def _load_trb(trb_path):
-    """RFdiffusionの.trbファイルを安全に読み込む"""
-    try:
-        with open(trb_path, "rb") as f:
-            return pickle.load(f)
-    except (pickle.UnpicklingError, EOFError):
-        import torch
-        return torch.load(trb_path, map_location="cpu", weights_only=False)
-
-
-def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
-    """RFdiffusionの出力(hal)から、新規生成された残基だけを元の全原子構造に差し込む。"""
-    trb = _load_trb(trb_path)
+def _get_provide_seq_ranges(pdb_path, missing_regions):
+    """provide_seqに渡すための「生成構造全体の0始まりインデックス」の範囲を算出する"""
+    provide_seq_indices = []
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("prep", pdb_path)
     
-    hal_idx = [(c, int(r)) for c, r in trb["con_hal_pdb_idx"]]
-    ref_idx = [(c, int(r)) for c, r in trb["con_ref_pdb_idx"]]
-    hal_to_ref = dict(zip(hal_idx, ref_idx))
-    generated_positions = {}
+    current_idx = 0
+    for chain in structure[0]:
+        cid = chain.id
+        for res in chain:
+            if res.id[0] != " ":
+                continue
+            resnum = res.id[1]
+            
+            # この残基が欠損（再生成対象）かチェック
+            is_missing = False
+            if cid in missing_regions:
+                for start_res, end_res in missing_regions[cid]:
+                    if start_res <= resnum <= end_res:
+                        is_missing = True
+                        break
+                        
+            if is_missing:
+                provide_seq_indices.append(current_idx)
+            current_idx += 1
+            
+    # 連続するインデックスを "9-13" のような範囲文字列に圧縮
+    ranges = []
+    if provide_seq_indices:
+        start = provide_seq_indices[0]
+        prev = provide_seq_indices[0]
+        for idx in provide_seq_indices[1:]:
+            if idx == prev + 1:
+                prev = idx
+            else:
+                ranges.append(f"{start}-{prev}")
+                start = idx
+                prev = idx
+        ranges.append(f"{start}-{prev}")
+        
+    return ranges
 
+
+def _merge_designed_region(original_pdb_path, hal_pdb_path, missing_regions, work_dir):
+    """
+    全マッピングで出力されたRFdiffusionの結果(hal)から、
+    missing_regionsに該当する残基の座標だけを元の構造に差し替える。
+    """
     parser = PDBParser(QUIET=True)
     orig_structure = parser.get_structure("orig", original_pdb_path)
     hal_structure = parser.get_structure("hal", hal_pdb_path)
-    orig_model, hal_model = orig_structure[0], hal_structure[0]
+    orig_model = orig_structure[0]
+    hal_model = hal_structure[0]
 
-    for hal_chain in hal_model:
-        hal_cid = hal_chain.id
-        ref_cid = next((rc for (hc, _), (rc, _) in zip(hal_idx, ref_idx) if hc == hal_cid), hal_cid)
-        if ref_cid not in orig_model:
+    for cid, regions in missing_regions.items():
+        if cid not in orig_model or cid not in hal_model:
             continue
-        orig_chain = orig_model[ref_cid]
+        orig_chain = orig_model[cid]
+        hal_chain = hal_model[cid]
 
-        prev_ref_resnum = None
-        pending_new = []
+        for start_res, end_res in regions:
+            for resnum in range(start_res, end_res + 1):
+                hal_res_list = [r for r in hal_chain if r.id[1] == resnum and r.id[0] == " "]
+                if not hal_res_list:
+                    continue
+                hal_res = hal_res_list[0].copy()
 
-        def _flush(next_ref_resnum):
-            if not pending_new:
-                return
-            if prev_ref_resnum is not None:
-                start = prev_ref_resnum + 1
-            elif next_ref_resnum is not None:
-                start = next_ref_resnum - len(pending_new)
-            else:
-                start = 1
-                
-            for offset, hal_res in enumerate(pending_new):
-                new_resnum = start + offset
-                new_id = (" ", new_resnum, " ")
-                
-                # 同一残基番号を持つ既存の残基（HETATM等）を安全に一掃
-                to_detach = [res.id for res in orig_chain if res.id[1] == new_resnum]
+                to_detach = [r.id for r in orig_chain if r.id[1] == resnum]
                 for rid in to_detach:
                     orig_chain.detach_child(rid)
-                    
-                hal_res.id = new_id
-                orig_chain.add(hal_res)
-                generated_positions.setdefault(ref_cid, set()).add(new_resnum)
-            pending_new.clear()
 
-        for hal_res in hal_chain:
-            key = (hal_cid, hal_res.id[1])
-            if key in hal_to_ref:
-                _, ref_resnum = hal_to_ref[key]
-                _flush(ref_resnum)
-                prev_ref_resnum = ref_resnum
-            else:
-                pending_new.append(hal_res.copy())
-        _flush(None)
+                orig_chain.add(hal_res)
 
         orig_chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))
 
@@ -185,24 +202,15 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
     io = PDBIO()
     io.set_structure(orig_structure)
     io.save(out_path)
-    return out_path, generated_positions
+    return out_path
 
 
 def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
-    """
-    1. 欠損位置を特定
-    2. FASTAから正しい配列を復元
-    3. 配列指定付き(provide_seq)でRFdiffusionを実行し、元構造とマージする
-    """
     fixer = PDBFixer(filename=pdb_path)
     fixer.findMissingResidues()
-    contig = _build_contig(fixer)
 
-    # ステップ1: 欠損領域の位置と配列の特定
     pdb_complex_residues, generated_resnums_dict, missing_regions = _get_expected_missing_resnums(fixer)
-    provide_seq_list = []
 
-    # ステップ2: グローバルマッピングと RFdiffusion用フォーマットへの変換
     if pdb_id and rf_config.get("reassign_sequence_from_fasta") and generated_resnums_dict:
         fasta_text = fetch_rcsb_fasta(pdb_id, cache_dir=rf_config.get("fasta_cache_dir"))
         fasta_sequences = parse_rcsb_fasta(fasta_text)
@@ -212,40 +220,44 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
             generated_resnums_dict=generated_resnums_dict,
             fasta_sequences=fasta_sequences
         )
+    else:
+        complex_corrections = {}
 
-        for cid, regions in missing_regions.items():
-            if cid not in complex_corrections:
-                continue
-            corrections = complex_corrections[cid]
-            for start_res, end_res in regions:
-                seq_chars = []
-                for resnum in range(start_res, end_res + 1):
-                    # 復元された3文字コードを1文字コードに変換 (不明な場合は安全のため 'G' にフォールバック)
-                    resname = corrections.get(resnum, "GLY")
-                    seq_chars.append(_THREE_TO_ONE.get(resname, "G"))
-                
-                seq_str = "".join(seq_chars)
-                provide_seq_item = {
-                    "res_idx": f"{cid}{start_res}-{end_res}",
-                    "seq": seq_str
-                }
-                provide_seq_list.append(provide_seq_item)
+    # 1. 欠損部に正しい配列を持つダミー残基を挿入（入力配列の固定）
+    input_pdb_for_rfdiffusion = _prepare_input_pdb_with_correct_sequence(
+        pdb_path, complex_corrections, missing_regions, work_dir
+    )
 
-    # ステップ3: コマンド構築と実行
+    # 2. ダミー残基ごと全チェーンをマッピングする contig を構築（例: A1-100/0/B1-50）
+    contig = _build_contig_from_prepared_pdb(input_pdb_for_rfdiffusion)
+    
+    # 3. ダミー残基部分の「座標」を再生成させるための inpaint_str の構築
+    inpaint_str_list = []
+    for cid, regions in missing_regions.items():
+        if cid not in complex_corrections:
+            continue
+        for start_res, end_res in regions:
+            inpaint_str_list.append(f"{cid}{start_res}-{end_res}")
+
+    # 4. ダミー残基部分の「配列（正しいアミノ酸）」を維持するための provide_seq (0始まりインデックス)
+    provide_seq_ranges = _get_provide_seq_ranges(input_pdb_for_rfdiffusion, missing_regions)
+
     out_prefix = os.path.join(work_dir, "rfdiffusion_out")
     cmd = [
         "python", rf_config["script_path"],
         f"inference.output_prefix={out_prefix}",
-        f"inference.input_pdb={os.path.abspath(pdb_path)}",
+        f"inference.input_pdb={os.path.abspath(input_pdb_for_rfdiffusion)}",
         f"inference.model_directory_path={rf_config['model_directory_path']}",
         f"contigmap.contigs=[{contig}]",
         f"inference.num_designs={rf_config.get('num_designs', 1)}",
     ]
 
-    # 復元した配列情報があればJSON化して追加
-    if provide_seq_list:
-        seq_arg = f"contigmap.provide_seq=['{json.dumps(provide_seq_list)}']"
-        cmd.append(seq_arg)
+    if inpaint_str_list:
+        cmd.append(f"contigmap.inpaint_str=[{','.join(inpaint_str_list)}]")
+    if provide_seq_ranges:
+        cmd.append(f"contigmap.provide_seq=[{','.join(provide_seq_ranges)}]")
+
+    print(f"[Info] Running RFdiffusion with command:\n{' '.join(cmd)}")
 
     result = subprocess.run(
         cmd, capture_output=True, text=True,
@@ -255,13 +267,10 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
         raise RuntimeError(f"RFdiffusion failed: {result.stderr[-2000:]}")
 
     hal_pdb_path = f"{out_prefix}_0.pdb"
-    trb_path = f"{out_prefix}_0.trb"
     if not os.path.exists(hal_pdb_path):
         raise RuntimeError(f"RFdiffusion output not found: {hal_pdb_path}")
-    if not os.path.exists(trb_path):
-        raise RuntimeError(f"RFdiffusion .trb file not found: {trb_path}")
 
-    # 構造のマージ (指定した配列情報に基づく正しいバックボーン・側鎖がPDBに統合される)
-    merged_path, _ = _merge_designed_region(pdb_path, hal_pdb_path, trb_path, work_dir)
+    # .trb ファイルを使わず、missing_regions に基づいて直接座標をマージ
+    merged_path = _merge_designed_region(pdb_path, hal_pdb_path, missing_regions, work_dir)
 
     return merged_path
