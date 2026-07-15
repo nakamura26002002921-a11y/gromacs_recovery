@@ -1,0 +1,59 @@
+name: gromacs_recovery
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  # --- Base Python & Core Libraries ---
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - pyyaml
+  - requests
+  - biopython
+  - networkx
+
+  # --- PyTorch Stack (CUDA 12.1 Compatible) ---
+  # RFdiffusion and DGL require specific CUDA versions. 
+  # Using PyTorch 2.4.0 with CUDA 12.1 as a stable baseline for RFdiffusion 1.1.0
+  - pytorch=2.4.0
+  - torchvision=0.19.0
+  - torchaudio=2.4.0
+  - pytorch-cuda=12.1
+  - cudatoolkit=12.1
+
+  # --- Deep Graph Library (DGL) ---
+  # Must match PyTorch and CUDA versions. 
+  # Note: dgl 2.x might have compatibility issues with some older RFdiffusion setups. 
+  # If issues arise, pin to 1.1.3 or use the pip wheel from dgl.ai
+  - dgl=2.4.0
+
+  # --- Structural Biology & Simulation ---
+  - openmm=8.5.2
+  - pdbfixer=1.12.0
+
+  # --- RFdiffusion Dependencies (via Pip for precision) ---
+  # Some RFdiffusion dependencies are not easily available via conda or require specific builds
+  - pip:
+    - rfdiffusion==1.1.0
+    - se3-transformer==1.0.0
+    - e3nn==0.3.3
+    - hydra-core==1.3.4
+    - omegaconf==2.3.1
+    - dllogger==1.1.0
+    
+    # --- GROMACS Recovery Agent Dependencies ---
+    - langgraph==1.2.9
+    - langchain-core==1.4.9
+    - langgraph-checkpoint==4.1.1
+    - langgraph-prebuilt==1.1.0
+    - langgraph-sdk==0.4.2
+    - langsmith==0.10.2
+    - pydantic==2.13.4
+    - typing-extensions
+    - tqdm
+    - matplotlib
+    - wandb
