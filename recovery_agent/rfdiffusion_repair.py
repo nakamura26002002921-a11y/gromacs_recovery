@@ -107,13 +107,15 @@ def _prepare_input_pdb_with_correct_sequence(pdb_path, corrections, missing_regi
 def _build_contig_from_prepared_pdb(pdb_path):
     """ダミー補完済みPDBから全チェーンをマッピングするcontigを生成。
 
-    RFdiffusionのcontig記法では、
-      - "/" は同一出力チェーン内でセグメントを連結する区切り（例: A2-100/10-10/A111-200 のような1本のchain内のギャップ表現）
-      - "," は独立した別々の出力チェーンを区切る記法
-    である。マルチチェーンの複合体（A, B, C, ... の各チェーンをそれぞれ
-    別チェーンとしてRFdiffusionに渡したい場合）は "," で連結しなければならない。
-    誤って "/0/" で連結すると、全チェーンが1本のchainとして扱われてしまい、
-    "Multiple chain IDs in chain" のようなアサーションエラーになる。
+    RFdiffusionのcontig記法（公式ドキュメント/実例に基づく）:
+      - "/" はセグメントの連結（同一の入力チェーン内の断片をつなぐ場合や、
+        直後に "0" を置いて "chain break" を表す場合に使う）。
+      - 複数の入力チェーンをそれぞれ独立した出力チェーンとして扱わせたい場合は、
+        各チェーンのブロックの間に "/0 "（スラッシュ0 + 半角スペース）を挟む。
+        例: "A2-525/0 B2-525/0 C2-525" のように、チェーンの区切りは
+        カンマではなく "/0 "(chain-break + スペース) である。
+      - カンマ(,)はcontigsのチェーン区切りには使わない
+        （provide_seq / inpaint_str など、範囲のリストを列挙する引数の区切りとして使う）。
     """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("prep", pdb_path)
@@ -128,8 +130,8 @@ def _build_contig_from_prepared_pdb(pdb_path):
         end_num = residues[-1].id[1]
         chain_groups.append(f"{cid}{start_num}-{end_num}")
         
-    # 【重要】RFdiffusionで複数チェーンを独立したchainとして扱わせる正しい記法はカンマ区切り
-    return ",".join(chain_groups)
+    # 【重要】RFdiffusionでチェーンを独立させる正しい記法は "/0 "(スラッシュ0+スペース)
+    return "/0 ".join(chain_groups)
 
 
 def _get_provide_seq_ranges(pdb_path, missing_regions):
@@ -175,41 +177,91 @@ def _get_provide_seq_ranges(pdb_path, missing_regions):
     return ranges
 
 
-def _merge_designed_region(original_pdb_path, hal_pdb_path, missing_regions, work_dir):
+def _merge_designed_region(input_pdb_for_rfdiffusion, hal_pdb_path, trb_path, missing_regions, work_dir):
     """
-    全マッピングで出力されたRFdiffusionの結果(hal)から、
-    missing_regionsに該当する残基の座標だけを元の構造に差し替える。
+    RFdiffusionの出力(hal)から、新規生成された残基の座標だけを
+    ダミー補完済み入力PDB(input_pdb_for_rfdiffusion)へマージする。
+
+    【重要】RFdiffusionは、入力PDBに複数チェーンがあっても出力PDBで
+    チェーンを勝手に統合・再編成することがある(既知の挙動。例:
+    https://github.com/RosettaCommons/RFdiffusion/issues/315 )。
+    そのため出力側の "chain id" は当てにできず、chain idでの突き合わせは
+    静かに失敗して(該当チェーンがhal_model側に無いとみなされ)マージが
+    スキップされ、欠損残基がそのまま残ってしまう不具合の原因になっていた。
+
+    代わりに .trb ファイルの con_ref_pdb_idx / con_hal_pdb_idx
+    (= 「元のPDBのどの(chain,resnum)が、出力PDBのどの(chain,resnum)に
+    対応するか」という、motif=保持された残基についての対応表)を使う。
+    出力PDBの残基のうち、この対応表に載っていないものが
+    「新規生成された残基」であり、これを入力側の欠損位置の並び順と
+    1対1で対応させてマージする。
     """
+    import pickle
+
+    with open(trb_path, "rb") as f:
+        trb = pickle.load(f)
+
+    # con_hal_pdb_idx: 出力PDB上で「保持された(=新規生成でない)」残基の (chain, resnum) 集合
+    kept_hal_ids = set(trb.get("con_hal_pdb_idx", []))
+
     parser = PDBParser(QUIET=True)
-    orig_structure = parser.get_structure("orig", original_pdb_path)
+    input_structure = parser.get_structure("input", input_pdb_for_rfdiffusion)
     hal_structure = parser.get_structure("hal", hal_pdb_path)
-    orig_model = orig_structure[0]
+    input_model = input_structure[0]
     hal_model = hal_structure[0]
 
-    for cid, regions in missing_regions.items():
-        if cid not in orig_model or cid not in hal_model:
+    # 出力PDBの全残基を、PDB内の出現順（chainの並び順→resnumの並び順）でリスト化
+    hal_residues_in_order = []
+    for chain in hal_model:
+        for res in chain:
+            if res.id[0] != " ":
+                continue
+            hal_residues_in_order.append((chain.id, res.id[1], res))
+
+    # 「新規生成された」出力残基だけを出現順に抽出
+    newly_generated_hal_residues = [
+        res for (cid, resnum, res) in hal_residues_in_order
+        if (cid, resnum) not in kept_hal_ids
+    ]
+
+    # 入力側（ダミー補完済みPDB）の欠損位置も、chainの並び順→resnumの昇順で同じ順序に並べる
+    # ※ input_pdb_for_rfdiffusion の chain 順序が RFdiffusion に渡した contig の順序と
+    #   一致している前提（_prepare_input_pdb_with_correct_sequenceで生成した構造そのまま）
+    expected_missing_slots = []
+    for chain in input_model:
+        cid = chain.id
+        if cid not in missing_regions:
             continue
-        orig_chain = orig_model[cid]
-        hal_chain = hal_model[cid]
-
-        for start_res, end_res in regions:
+        for start_res, end_res in missing_regions[cid]:
             for resnum in range(start_res, end_res + 1):
-                hal_res_list = [r for r in hal_chain if r.id[1] == resnum and r.id[0] == " "]
-                if not hal_res_list:
-                    continue
-                hal_res = hal_res_list[0].copy()
+                expected_missing_slots.append((cid, resnum))
 
-                to_detach = [r.id for r in orig_chain if r.id[1] == resnum]
-                for rid in to_detach:
-                    orig_chain.detach_child(rid)
+    if len(newly_generated_hal_residues) != len(expected_missing_slots):
+        raise RuntimeError(
+            "RFdiffusion output/trb residue count mismatch: "
+            f"expected {len(expected_missing_slots)} newly generated residues "
+            f"(from missing_regions), but found {len(newly_generated_hal_residues)} "
+            "in the output PDB that are not marked as 'kept' in the .trb file. "
+            "This usually means the contig string did not match the input PDB "
+            "structure, or RFdiffusion merged/reordered chains unexpectedly."
+        )
 
-                orig_chain.add(hal_res)
-
-        orig_chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))
+    # 1対1で対応付けて、入力構造の欠損残基をhalの新規生成残基座標で置き換える
+    merged_structure = input_structure
+    merged_model = merged_structure[0]
+    for (cid, resnum), hal_res in zip(expected_missing_slots, newly_generated_hal_residues):
+        chain = merged_model[cid]
+        to_detach = [r.id for r in chain if r.id[1] == resnum and r.id[0] == " "]
+        for rid in to_detach:
+            chain.detach_child(rid)
+        new_res = hal_res.copy()
+        new_res.id = (" ", resnum, " ")
+        chain.add(new_res)
+        chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))
 
     out_path = os.path.join(work_dir, "rfdiffusion_merged.pdb")
     io = PDBIO()
-    io.set_structure(orig_structure)
+    io.set_structure(merged_structure)
     io.save(out_path)
     return out_path
 
@@ -237,7 +289,7 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
         pdb_path, complex_corrections, missing_regions, work_dir
     )
 
-    # 2. ダミー残基ごと全チェーンをマッピングする contig を構築（例: A1-100,B1-50）
+    # 2. ダミー残基ごと全チェーンをマッピングする contig を構築（例: A1-100/0 B1-50）
     contig = _build_contig_from_prepared_pdb(input_pdb_for_rfdiffusion)
     
     # 3. ダミー残基部分の「座標」を再生成させるための inpaint_str の構築
@@ -276,10 +328,17 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
         raise RuntimeError(f"RFdiffusion failed: {result.stderr[-2000:]}")
 
     hal_pdb_path = f"{out_prefix}_0.pdb"
+    trb_path = f"{out_prefix}_0.trb"
     if not os.path.exists(hal_pdb_path):
         raise RuntimeError(f"RFdiffusion output not found: {hal_pdb_path}")
+    if not os.path.exists(trb_path):
+        raise RuntimeError(f"RFdiffusion .trb metadata not found: {trb_path}")
 
-    # .trb ファイルを使わず、missing_regions に基づいて直接座標をマージ
-    merged_path = _merge_designed_region(pdb_path, hal_pdb_path, missing_regions, work_dir)
+    # .trb ファイルの con_hal_pdb_idx を使い、「新規生成された残基」を
+    # チェーンIDに依存せず特定してマージする（RFdiffusionは出力側で
+    # チェーンを統合・再編成することがあるため、chain idでの突き合わせは不可）
+    merged_path = _merge_designed_region(
+        input_pdb_for_rfdiffusion, hal_pdb_path, trb_path, missing_regions, work_dir
+    )
 
     return merged_path
