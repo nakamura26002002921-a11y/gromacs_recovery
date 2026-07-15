@@ -2,8 +2,15 @@
 import os
 import subprocess
 import pickle
+import re
 from Bio.PDB import PDBParser, PDBIO
 from pdbfixer import PDBFixer
+
+
+def _parse_resnum(res_id):
+    """'100A' や '-1' のようなPDB残基IDから整数部分のみを抽出する（挿入コード対策）"""
+    m = re.search(r'-?\d+', str(res_id))
+    return int(m.group()) if m else 0
 
 
 def _build_contig(fixer):
@@ -14,7 +21,7 @@ def _build_contig(fixer):
         if not residues:
             continue
         cid = chain.id
-        start_num, end_num = int(residues[0].id), int(residues[-1].id)
+        start_num, end_num = _parse_resnum(residues[0].id), _parse_resnum(residues[-1].id)
 
         # このチェーンの欠損箇所を全て集め、位置(pos)の昇順に処理する
         gaps = sorted(
@@ -36,11 +43,11 @@ def _build_contig(fixer):
                 cursor = 0
                 continue
             if cursor < pos:
-                seg_end_num = int(residues[pos - 1].id)
+                seg_end_num = _parse_resnum(residues[pos - 1].id)
                 tokens.append(f"{cid}{seg_start_num}-{seg_end_num}")
             tokens.append(f"{gap_len}-{gap_len}")
             cursor = pos
-            seg_start_num = int(residues[pos].id) if pos < len(residues) else None
+            seg_start_num = _parse_resnum(residues[pos].id) if pos < len(residues) else None
         if cursor < len(residues) and seg_start_num is not None:
             tokens.append(f"{cid}{seg_start_num}-{end_num}")
 
@@ -62,8 +69,10 @@ def _load_trb(trb_path):
 def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
     """RFdiffusionの出力(hal)から、新規生成された残基だけを元の全原子構造に差し込む。"""
     trb = _load_trb(trb_path)
-    hal_idx = [(c, int(r)) for c, r in trb["con_hal_pdb_idx"]]
-    ref_idx = [(c, int(r)) for c, r in trb["con_ref_pdb_idx"]]
+    
+    # 修正: 文字列("A10"など)を安全にスライスして分解 (too many values to unpack 対策)
+    hal_idx = [(item[0], int(item[1:])) for item in trb["con_hal_pdb_idx"]]
+    ref_idx = [(item[0], int(item[1:])) for item in trb["con_ref_pdb_idx"]]
     hal_to_ref = dict(zip(hal_idx, ref_idx))
     generated_positions = {}
 
@@ -91,13 +100,20 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
                 start = next_ref_resnum - len(pending_new)
             else:
                 start = 1
+                
             for offset, hal_res in enumerate(pending_new):
-                new_id = (" ", start + offset, " ")
-                if new_id in orig_chain:
-                    orig_chain.detach_child(new_id)
+                new_resnum = start + offset
+                new_id = (" ", new_resnum, " ")
+                
+                # 修正: 同一残基番号を持つ既存の残基（HETATMや水分子を含む）を安全に一掃
+                # Biopythonのid仕様 (hetero, resseq, icode) を考慮し、resseqが一致するものを全て退避
+                to_detach = [res.id for res in orig_chain if res.id[1] == new_resnum]
+                for rid in to_detach:
+                    orig_chain.detach_child(rid)
+                    
                 hal_res.id = new_id
                 orig_chain.add(hal_res)
-                generated_positions.setdefault(ref_cid, set()).add(new_id[1])
+                generated_positions.setdefault(ref_cid, set()).add(new_resnum)
             pending_new.clear()
 
         for hal_res in hal_chain:
