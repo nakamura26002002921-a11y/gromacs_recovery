@@ -125,8 +125,8 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
     """RFdiffusionの出力(hal)から、新規生成された残基だけを元の全原子構造に差し込む。"""
     trb = _load_trb(trb_path)
     
-    hal_idx = [(item[0], int(item[1:])) for item in trb["con_hal_pdb_idx"]]
-    ref_idx = [(item[0], int(item[1:])) for item in trb["con_ref_pdb_idx"]]
+    hal_idx = [(c, int(r)) for c, r in trb["con_hal_pdb_idx"]]
+    ref_idx = [(c, int(r)) for c, r in trb["con_ref_pdb_idx"]]
     hal_to_ref = dict(zip(hal_idx, ref_idx))
     generated_positions = {}
 
