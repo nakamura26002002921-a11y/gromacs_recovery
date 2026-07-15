@@ -1,8 +1,9 @@
 # recovery_agent/rfdiffusion_repair.py
 import os
 import subprocess
-from pdbfixer import PDBFixer
+import pickle
 from Bio.PDB import PDBParser, PDBIO
+from pdbfixer import PDBFixer
 
 
 def _build_contig(fixer):
@@ -49,10 +50,7 @@ def _build_contig(fixer):
 
 
 def _load_trb(trb_path):
-    # RFdiffusionの.trbファイルは torch.save() ではなく通常の pickle.dump() で保存されるため、
-    # torch.load() (zip/tar形式を前提とするパーサ) では "Invalid magic number; corrupt file?" になる。
-    # まず素のpickleとして読み、失敗した場合のみtorch.loadにフォールバックする。
-    import pickle
+    """RFdiffusionの.trbファイルを安全に読み込む"""
     try:
         with open(trb_path, "rb") as f:
             return pickle.load(f)
@@ -62,25 +60,11 @@ def _load_trb(trb_path):
 
 
 def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
-    """RFdiffusionの出力(hal)は骨格原子のみ・複合体全体を作り直したものであり、
-    側鎖やHETATM(水・イオン・補因子等)を含まない。そのまま採用すると構造の大部分を
-    失ってしまうため、.trbの対応表(con_hal_pdb_idx <-> con_ref_pdb_idx)を使って
-    「実際に新規生成された(=対応表に無い)残基」だけを元の全原子構造に差し込む。
-
-    注意: hal側の残基番号はRFdiffusionが全長(固定領域+新規生成領域)を通し番号で
-    振り直したものであり、元のPDBの番号(欠番のあるオリジナル番号)とは無関係。
-    新規残基をそのまま元の鎖に足すと番号がずれてしまうため、con_ref_pdb_idxで
-    分かる前後の既存残基の「元の番号」から補間して正しい番号を割り当てる。
-
-    戻り値: (統合後のPDBパス, generated_positions)
-      generated_positions: {ref_chain_id: {resnum, ...}, ...}
-        RFdiffusionが新規生成した(=本来のアミノ酸種が不明な。バックボーンのみでGLY)
-        残基の位置。後段の配列復元(sequence_recovery)で使用する。
-    """
+    """RFdiffusionの出力(hal)から、新規生成された残基だけを元の全原子構造に差し込む。"""
     trb = _load_trb(trb_path)
     hal_idx = [(c, int(r)) for c, r in trb["con_hal_pdb_idx"]]
     ref_idx = [(c, int(r)) for c, r in trb["con_ref_pdb_idx"]]
-    hal_to_ref = dict(zip(hal_idx, ref_idx))  # hal(出力側)の(鎖,番号) -> ref(元)の(鎖,番号)
+    hal_to_ref = dict(zip(hal_idx, ref_idx))
     generated_positions = {}
 
     parser = PDBParser(QUIET=True)
@@ -90,14 +74,13 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
 
     for hal_chain in hal_model:
         hal_cid = hal_chain.id
-        # このhal鎖が元のどの鎖に対応するかは、con_hal_pdb_idx/con_ref_pdb_idxのマッピングから判定する
         ref_cid = next((rc for (hc, _), (rc, _) in zip(hal_idx, ref_idx) if hc == hal_cid), hal_cid)
         if ref_cid not in orig_model:
-            continue  # 新規鎖の追加には未対応(既存鎖内の欠損補完のみサポート)
+            continue
         orig_chain = orig_model[ref_cid]
 
-        prev_ref_resnum = None   # 直前に確定した既存残基の「元の番号」
-        pending_new = []         # まだ番号が確定していない新規残基(hal順)
+        prev_ref_resnum = None
+        pending_new = []
 
         def _flush(next_ref_resnum):
             if not pending_new:
@@ -107,7 +90,7 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
             elif next_ref_resnum is not None:
                 start = next_ref_resnum - len(pending_new)
             else:
-                start = 1  # 前後どちらの手がかりも無い場合の最終手段
+                start = 1
             for offset, hal_res in enumerate(pending_new):
                 new_id = (" ", start + offset, " ")
                 if new_id in orig_chain:
@@ -121,13 +104,13 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
             key = (hal_cid, hal_res.id[1])
             if key in hal_to_ref:
                 _, ref_resnum = hal_to_ref[key]
-                _flush(ref_resnum)         # ここまで溜まっていた新規残基に番号を確定させる
+                _flush(ref_resnum)
                 prev_ref_resnum = ref_resnum
             else:
                 pending_new.append(hal_res.copy())
         _flush(None)
 
-        orig_chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))  # resseq順に並べ直す
+        orig_chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))
 
     out_path = os.path.join(work_dir, "rfdiffusion_merged.pdb")
     io = PDBIO()
@@ -137,14 +120,15 @@ def _merge_designed_region(original_pdb_path, hal_pdb_path, trb_path, work_dir):
 
 
 def _reassign_generated_sequence(merged_pdb_path, generated_positions, pdb_id, rf_config, work_dir):
-    """RFdiffusionが新規生成した残基(バックボーンのみ・GLY)について、RCSBの正式配列と
-    アラインメントして本来のアミノ酸種を推定し、resnameを付け替える。
-    側鎖原子は(GLYのものしか無い=事実上ないので)そのまま残し、後段のPDBFixerの
-    addMissingAtoms()に正しい残基名に基づいた側鎖の再構築を任せる。
+    """
+    【修正点】
+    鎖ごとのループ処理をやめ、複合体全体を一度に `recover_complex_sequences` に渡し、
+    ハンガリー法を用いたグローバルな最適マッピングを行います。
     """
     from Bio.PDB import PDBParser, PDBIO
-    from recovery_agent.sequence_recovery import fetch_rcsb_fasta, parse_rcsb_fasta, map_generated_residues_to_sequence
+    from recovery_agent.sequence_recovery import fetch_rcsb_fasta, parse_rcsb_fasta, recover_complex_sequences
 
+    # FASTAの取得とパース
     fasta_text = fetch_rcsb_fasta(pdb_id, cache_dir=rf_config.get("fasta_cache_dir"))
     fasta_sequences = parse_rcsb_fasta(fasta_text)
 
@@ -152,15 +136,28 @@ def _reassign_generated_sequence(merged_pdb_path, generated_positions, pdb_id, r
     structure = parser.get_structure("merged", merged_pdb_path)
     model = structure[0]
 
-    for chain_id, gen_resnums in generated_positions.items():
-        if chain_id not in model:
-            continue
-        chain = model[chain_id]
-        orig_chain_residues = {res.id[1]: res.resname for res in chain if res.id[0] == " "}
-        corrections = map_generated_residues_to_sequence(chain_id, orig_chain_residues, gen_resnums, fasta_sequences)
-        for resnum, correct_resname in corrections.items():
-            if resnum in chain:
-                chain[resnum].resname = correct_resname
+    # 1. 複合体全体の残基辞書を構築
+    pdb_complex_residues = {}
+    for chain_id in generated_positions.keys():
+        if chain_id in model:
+            chain = model[chain_id]
+            # HETATM等を除外したアミノ酸残基のみを取得
+            pdb_complex_residues[chain_id] = {res.id[1]: res.resname for res in chain if res.id[0] == " "}
+
+    # 2. MM-align的思想に基づくグローバル全体最適化を一括で実行
+    complex_corrections = recover_complex_sequences(
+        pdb_complex_residues=pdb_complex_residues,
+        generated_resnums_dict=generated_positions,
+        fasta_sequences=fasta_sequences
+    )
+
+    # 3. 最適化されたマッピング結果を各鎖に適用
+    for chain_id, corrections in complex_corrections.items():
+        if chain_id in model:
+            chain = model[chain_id]
+            for resnum, correct_resname in corrections.items():
+                if resnum in chain:
+                    chain[resnum].resname = correct_resname
 
     out_path = os.path.join(work_dir, "rfdiffusion_seq_recovered.pdb")
     io = PDBIO()
@@ -170,13 +167,7 @@ def _reassign_generated_sequence(merged_pdb_path, generated_positions, pdb_id, r
 
 
 def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
-    """RFdiffusionを実行し、新規生成された欠損部分だけを元構造に統合したPDBのパスを返す。
-
-    RFdiffusionは骨格(バックボーン)しか設計せず、新規生成領域は慣例的に全てGLYとして
-    出力される(アミノ酸の種類自体は設計しない)。rf_config['reassign_sequence_from_fasta']
-    が有効かつpdb_idが与えられている場合は、RCSBの正式配列とアラインメントして
-    新規生成位置の本来のアミノ酸種を復元する。
-    """
+    """RFdiffusionを実行し、新規生成された欠損部分だけを元構造に統合したPDBのパスを返す。"""
     fixer = PDBFixer(filename=pdb_path)
     fixer.findMissingResidues()
     contig = _build_contig(fixer)
@@ -203,8 +194,6 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
     if not os.path.exists(hal_pdb_path):
         raise RuntimeError(f"RFdiffusion output not found: {hal_pdb_path}")
     if not os.path.exists(trb_path):
-        # .trb (対応表)が無いと、どの残基が新規生成分かを安全に判定できず、
-        # 側鎖・HETATM・水を失った縮小構造をそのまま使ってしまう危険があるため停止する
         raise RuntimeError(f"RFdiffusion .trb file not found: {trb_path} (side-chain/HETATM-preserving merge requires it)")
 
     merged_path, generated_positions = _merge_designed_region(pdb_path, hal_pdb_path, trb_path, work_dir)
@@ -213,4 +202,3 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
         merged_path = _reassign_generated_sequence(merged_path, generated_positions, pdb_id, rf_config, work_dir)
 
     return merged_path
-
