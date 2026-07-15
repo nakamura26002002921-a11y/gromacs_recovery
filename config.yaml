@@ -15,8 +15,3 @@ rfdiffusion:
   pdb_id: null                          # 例: "6XYZ"。
   reassign_sequence_from_fasta: true    # RCSB FASTAで新規生成残基の配列を再割り当てするか
   fasta_cache_dir: "cache/fasta"        # ダウンロードしたFASTAのキャッシュ先(任意)
-  truncation:
-    # 巨大な複合体をそのままRFdiffusionに渡すとO(N^2)でGPUメモリを消費し
-    # CUDA OOMになるため、欠損部近傍だけを切り出して渡す。
-    anchor_padding_residues: 10       # 欠損区間の前後、何残基分をアンカーとして使うか
-    context_radius_angstrom: 15.0     # アンカーから何Å以内の残基を近傍として残すか
