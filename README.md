@@ -11,14 +11,14 @@ graph TD
     Start(("開始")) --> Check{"欠損判定<br>missing_residues.py"}
     
     Check -->|6残基以上| SeqRec["配列復元<br>sequence_recovery.py"]
-    Check -->|1〜5残基| PDBFix["局所修復<br>repair.py"]
+    Check -->|1〜5残基| PDBFix["局所修復<br>repair.py (PDBFixer)"]
     Check -->|0残基| RunGmx["pdb2gmx実行<br>observation.py"]
     
     SeqRec --> RFDiff["RFdiffusion実行<br>rfdiffusion_repair.py"]
-    PDBFix --> Merge["構造マージ<br>rfdiffusion_repair.py"]
-    RFDiff --> Merge
+    RFDiff --> Merge["構造マージ<br>rfdiffusion_repair.py"]
     
     Merge --> RunGmx
+    PDBFix --> RunGmx
     
     RunGmx -->|成功| Save(("完了"))
     RunGmx -->|失敗| Diag["エラー診断<br>diagnosis.py"]
