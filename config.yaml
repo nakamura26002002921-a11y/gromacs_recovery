@@ -15,3 +15,12 @@ rfdiffusion:
   pdb_id: null                          # 例: "6XYZ"。
   reassign_sequence_from_fasta: true    # RCSB FASTAで新規生成残基の配列を再割り当てするか
   fasta_cache_dir: "cache/fasta"        # ダウンロードしたFASTAのキャッシュ先(任意)
+
+modeller:
+  enabled: true                # RFdiffusion/PDBFixerいずれの経路でも、pdb2gmxの直前に
+                                # 新規生成/補完された残基周辺をMODELLERで局所極小化するか
+  license_key: "YOUR-MODELLER-LICENSE-KEY"  # MODELLER利用登録(無料)で発行されるキー
+  neighbor_window: 3           # 極小化対象に含める前後残基数のマージン
+  cg_iterations: 200           # Conjugate Gradientsの最大反復回数
+  md_iterations: 200           # MD annealingの最大反復回数(300K)
+  timeout_sec: 600             # 極小化処理のタイムアウト(秒、将来のtimeout付き実行用)
