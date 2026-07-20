@@ -78,7 +78,7 @@ graph TD
 
 #### 2. RFdiffusion: バックボーン専用の拡散生成モデル (Backbone-Only Generation)
 引用論文: Watson et al., "De novo design of protein structure and function with RFdiffusion", Nature, 2023.
-RFdiffusionは `contigmap.provide_seq` で「既知領域」の配列を条件として与えることはできますが、これは**構造をより安定にサンプリングするための条件付け**であり、**未知（欠損）領域の配列自体を生成する機能ではありません**。未知領域は一貫してGLYとして出力されます。
+RFdiffusionの `contigmap.provide_seq` オプションは **partial diffusion**（`diffuser.partial_T` を設定するモード）専用であり、通常のinpainting/designモードで渡すと `AssertionError: The provide_seq input is specifically for partial diffusion` で実行が失敗します。本エージェントは partial diffusion を使わず、contigの範囲指定（例: `A2-525`）だけで既存座標をそのまま保持させる通常のinpaintingモードを用いるため、`provide_seq` は使用しません。既知領域の座標保持はcontig側の範囲指定のみで行われ、未知（欠損）領域は一貫してGLYとして出力されます。
 そのため本エージェントでは、RFdiffusionを「バックボーンの妥当な立体配座を提案するモデル」として使い切ったあと、`sequence_recovery.py` が別途RCSB FASTAとのアラインメントによって配列を推定し、GLYの残基名を正しいアミノ酸名に書き換えます。これにより、RFdiffusionに存在しない機能（配列生成）を誤って期待することなく、モデルの仕様に忠実な形で物理的に妥当性の高い修復を実現します。
 
 📊 RFdiffusion の生成アルゴリズムフロー
