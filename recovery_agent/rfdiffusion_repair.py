@@ -196,7 +196,16 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
     with open(trb_path, "rb") as f:
         trb = pickle.load(f)
 
-    kept_hal_ids = set(trb.get("con_hal_pdb_idx", []))
+    # 【重要】RFdiffusionのcontigs.py (get_mappings) の仕様により、
+    # con_hal_pdb_idx に格納されるhal側チェーンIDは、入力PDBの実際のチェーン文字
+    # (例: 'B') とは無関係に、常に chain_order[0]='A' から採番される
+    # (expand_sampled_mask() の inpaint_hal.extend([(chain_order[inpaint_chain_idx], i)...]) を参照)。
+    # 単一鎖のinpaintingでは元のチェーンが 'A' か 'B' かによらず常にこの採番になるため、
+    # チェーン文字同士を突き合わせる判定は信頼できない(元チェーンが 'A' の場合のみ
+    # たまたま一致して見えてしまう)。
+    # hal側の残基番号は1本のhal鎖内で連番かつユニークなので、番号のみで
+    # 「既存(kept)」領域かどうかを判定する。
+    kept_hal_resnums = {v[1] for v in trb.get("con_hal_pdb_idx", [])}
 
     parser = PDBParser(QUIET=True)
     complex_struct = parser.get_structure("cpx", current_complex_pdb)
@@ -208,12 +217,7 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
         for res in chain:
             if res.id[0] != " ":
                 continue
-            is_kept = False
-            for kept_id in kept_hal_ids:
-                if kept_id[0] == chain.id and kept_id[1] == res.id[1]:
-                    is_kept = True
-                    break
-            if not is_kept:
+            if res.id[1] not in kept_hal_resnums:
                 newly_generated_hal_residues.append(res)
 
     # 複合体PDBの挿入先スロットを算出
