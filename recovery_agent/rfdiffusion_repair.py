@@ -130,14 +130,21 @@ def _clean_and_extract_chain_pdb(original_pdb_path, target_chain_id, work_dir):
     return out_path, sorted(valid_resnums)
 
 
-def _build_optimized_contig_and_seq(valid_resnums, missing_regions, chain_id):
+def _build_optimized_contig(valid_resnums, missing_regions, chain_id):
     """
-    実在する座標ブロックと欠損ブロックを順番に並べ、
-    RFdiffusionに渡す最適化された contig と provide_seq を生成する。
+    実在する座標ブロックと欠損ブロックを順番に並べ、RFdiffusionに渡す
+    最適化された contig を生成する。
+
+    【注意】contigmap.provide_seq は partial diffusion (diffuser.partial_T
+    を設定するモード) 専用のオプションであり、通常のinpainting/design
+    モードで渡すとRFdiffusion側の初期化で
+        AssertionError: The provide_seq input is specifically for partial diffusion
+    となり実行が失敗する。本エージェントは partial diffusion を使わず、
+    contig の範囲指定（例: "A2-525"）だけで既存座標をそのまま保持させる
+    通常のinpaintingモードを用いるため、provide_seq は一切生成・使用しない。
     """
     tokens = []
-    provide_seq_ranges = []
-    
+
     # 既存の残基を連続したセグメントにまとめる
     segments = []
     if valid_resnums:
@@ -156,25 +163,19 @@ def _build_optimized_contig_and_seq(valid_resnums, missing_regions, chain_id):
         all_blocks.append(('existing', s, e))
     for s, e in sorted(missing_regions, key=lambda x: x[0]):
         all_blocks.append(('missing', s, e))
-        
+
     all_blocks.sort(key=lambda x: x[1])
-    
-    current_out_idx = 0
+
     for btype, s, e in all_blocks:
         if btype == 'existing':
             tokens.append(f"{chain_id}{s}-{e}")
-            seg_len = e - s + 1
-            provide_seq_ranges.append(f"{current_out_idx}-{current_out_idx + seg_len - 1}")
-            current_out_idx += seg_len
         elif btype == 'missing':
             gap_len = e - s + 1
             tokens.append(f"{gap_len}-{gap_len}")
-            current_out_idx += gap_len
-            
+
     contig = ",".join(tokens)
-    provide_seq = ",".join(provide_seq_ranges)
-    
-    return contig, provide_seq
+
+    return contig
 
 
 def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, target_cid, regions, out_path):
@@ -273,8 +274,9 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
         # 1. 複合体から対象鎖のみを抽出し、座標異常を除去 + Jittering適用
         clean_pdb_path, valid_resnums = _clean_and_extract_chain_pdb(current_complex_pdb, cid, work_dir)
         
-        # 2. 最適化されたcontigとprovide_seqの作成
-        contig, provide_seq = _build_optimized_contig_and_seq(valid_resnums, regions, cid)
+        # 2. 最適化されたcontigの作成 (provide_seqは使用しない。理由は
+        #    _build_optimized_contig() のdocstring参照)
+        contig = _build_optimized_contig(valid_resnums, regions, cid)
         print(f"[Info] Optimized contig for chain {cid}: {contig}")
         
         # 3. 引数の構築
@@ -287,8 +289,6 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
             f"contigmap.contigs=[{contig}]",
             f"inference.num_designs={rf_config.get('num_designs', 1)}",
         ]
-        if provide_seq:
-            cmd.append(f"contigmap.provide_seq=[{provide_seq}]")
             
         print(f"[Info] Running RFdiffusion for chain {cid}...")
         result = subprocess.run(
