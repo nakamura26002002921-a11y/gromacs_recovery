@@ -22,8 +22,10 @@ graph TD
     Merge --> SeqRec["② 配列復元<br>sequence_recovery.py<br>（FASTAとのアライメントでGLY→正しい残基名に置換）"]
     SeqRec --> FillAtoms["③ 側鎖原子補完<br>PDBFixer<br>（置換後の残基名に対応する側鎖を生成）"]
 
-    FillAtoms --> RunGmx
-    PDBFix --> RunGmx
+    FillAtoms --> Minimize["④ 局所エネルギー極小化<br>modeller_minimize.py (MODELLER)<br>（新規/補完残基とその近傍のみ最適化）"]
+    PDBFix --> Minimize
+
+    Minimize --> RunGmx
 
     RunGmx -->|成功| Save(("完了"))
     RunGmx -->|失敗| Diag["エラー診断<br>diagnosis.py"]
@@ -40,11 +42,13 @@ graph TD
     style PDBFix fill:#e8f5e9,stroke:#2e7d32
     style FillAtoms fill:#e8f5e9,stroke:#2e7d32
     style SeqRec fill:#f3e5f5,stroke:#7b1fa2
+    style Minimize fill:#e0f2f1,stroke:#00695c
     style Save fill:#e8f5e9,stroke:#2e7d32
     style Fail fill:#ffebee,stroke:#c62828
 ```
 
 > `graph.py` の `rfdiffusion_node` は上図の①〜③を1つのノード内で順番に呼び出します（`run_rfdiffusion()` → `apply_sequence_recovery()` → `_fill_missing_atoms()`）。RFdiffusion自体はあくまでバックボーン生成器であり、配列の正しさに責任を持たない点が本フローの要です。
+> ④の `modeller_minimize` ノードは、RFdiffusion経路（6残基以上）・PDBFixer経路（1〜5残基）のどちらから来た場合でも共通して通過します。新規生成/補完された残基とその近傍のみを対象に MODELLER で局所的なエネルギー極小化（Conjugate Gradients + 短時間MD annealing）を行い、`pdb2gmx` がクラッシュ原子や不自然な結合長/角度で失敗する確率を下げます。`config.yaml` の `modeller.enabled: false` でスキップ可能です。
 
 ---
 
@@ -118,6 +122,7 @@ graph TD
 | Anaconda / Miniconda | 環境構築 | `conda` コマンドが使用可能であること |
 | GROMACS (`gmx`) | 前処理（pdb2gmx）の実行 | `gmx` が PATH 上に存在すること |
 | NVIDIA GPU (CUDA 12.8+) | RFdiffusion の推論 | CPU のみでは現実的な時間で完了しません |
+| MODELLER ライセンスキー | 修復後の局所エネルギー極小化 | [salilab.org](https://salilab.org/modeller/registration.html) で無料登録して取得 |
 
 ### 1.2 GROMACS のインストール
 conda環境とは別に、公式手順に従ってビルド・インストールし、`gmx` コマンドがPATHに通っていることを確認してください。
@@ -168,9 +173,20 @@ rfdiffusion:
                                       # RFdiffusion自体には配列を生成する機能がないため、この
                                       # フラグをfalseにすると新規領域はGLYのままpdb2gmxへ渡る。
   fasta_cache_dir: "log/fasta_cache" # FASTA 取得時のキャッシュディレクトリ
+
+modeller:
+  enabled: true                     # RFdiffusion/PDBFixerいずれの経路でも、pdb2gmxの直前に
+                                     # 新規生成/補完された残基周辺をMODELLERで局所極小化するか
+  license_key: "YOUR-MODELLER-LICENSE-KEY"  # MODELLER利用登録(無料)で発行されるキー
+  neighbor_window: 3                # 極小化対象に含める前後残基数のマージン
+  cg_iterations: 200                # Conjugate Gradientsの最大反復回数
+  md_iterations: 200                # MD annealing(300K)の最大反復回数
+  timeout_sec: 600                  # 極小化処理のタイムアウト（秒）
 ```
 
 > `pdb_id` は `graph.py` の実行時 `state` に `pdb_id` として渡します（`config.yaml` 直下ではなく呼び出しコード側で指定、詳細は [3.2](#32-コードから直接利用する場合) 参照）。`reassign_sequence_from_fasta: true` でも `pdb_id` が未指定の場合、配列復元はスキップされ新規領域はGLYのまま扱われます。
+>
+> `modeller.enabled: false` にすると極小化ステップはスキップされ、PDBFixerの出力（RFdiffusion経路の場合は配列復元＋側鎖補完済みの出力）がそのまま `pdb2gmx` に渡されます。MODELLERのライセンスキーは [salilab.org](https://salilab.org/modeller/registration.html) で無料登録して取得してください。
 
 ---
 
@@ -252,6 +268,7 @@ gromacs_recovery/
 │   ├── missing_residues.py          # 欠損残基数のカウント（分岐閾値の判定自体は graph.py 側）
 │   ├── rfdiffusion_repair.py        # RFdiffusion 呼び出し・構造マージ（バックボーンのみ生成、新規残基は常にGLY）
 │   ├── sequence_recovery.py         # MM-align的思想に基づくグローバル配列復元（RFdiffusion実行後の独立ステップ）
+│   ├── modeller_minimize.py         # MODELLERによる局所エネルギー極小化（RFdiffusion/PDBFixer両経路の仕上げ）
 │   ├── observation.py               # gmx pdb2gmx の実行と出力キャプチャ
 │   ├── diagnosis.py                 # pdb2gmx のエラー分類
 │   ├── repair.py                    # PDBfixer/Biopython による個別修復関数群
