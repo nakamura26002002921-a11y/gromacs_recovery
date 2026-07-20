@@ -286,7 +286,7 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
             f"inference.output_prefix={out_prefix}",
             f"inference.input_pdb={os.path.abspath(clean_pdb_path)}",
             f"inference.model_directory_path={rf_config['model_directory_path']}",
-            f"contigmap.contigs=[{contig}]",
+            f'contigmap.contigs=["{contig}"]',   # ← ここを修正
             f"inference.num_designs={rf_config.get('num_designs', 1)}",
         ]
             
