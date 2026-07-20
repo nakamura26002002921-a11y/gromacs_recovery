@@ -6,6 +6,8 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from Bio.Align import PairwiseAligner, substitution_matrices
 from Bio.Data.IUPACData import protein_letters_3to1
+from Bio.PDB import PDBParser, PDBIO
+from pdbfixer import PDBFixer
 
 RCSB_FASTA_URL = "https://www.rcsb.org/fasta/entry/{pdb_id}"
 
@@ -193,6 +195,118 @@ def recover_complex_sequences(pdb_complex_residues, generated_resnums_dict, fast
             complex_results[p_cid] = mapping
 
     return complex_results
+
+
+def _parse_resnum(res_id):
+    """'100A' や '-1' のようなPDB残基IDから整数部分のみを抽出する"""
+    m = re.search(r'-?\d+', str(res_id))
+    return int(m.group()) if m else 0
+
+
+def _get_generated_resnums_from_original(original_pdb_path):
+    """
+    RFdiffusion実行前の(まだ欠損がある)元PDBに対してPDBFixerの欠損検出を走らせ、
+    「どのチェーンのどの残基番号がRFdiffusionによって新規生成される予定だったか」を
+    復元する。rfdiffusion_repair.py の _get_expected_missing_resnums と同じロジック。
+
+    :return: pdb_complex_residues, generated_resnums_dict
+    """
+    fixer = PDBFixer(filename=original_pdb_path)
+    fixer.findMissingResidues()
+
+    pdb_complex_residues = {}
+    generated_resnums_dict = {}
+
+    for chain in fixer.topology.chains():
+        cid = chain.id
+        residues = list(chain.residues())
+        if not residues:
+            continue
+        pdb_complex_residues[cid] = {}
+        for res in residues:
+            pdb_complex_residues[cid][_parse_resnum(res.id)] = res.name
+
+    for chain in fixer.topology.chains():
+        cid = chain.id
+        residues = list(chain.residues())
+        gaps = sorted(
+            ((pos, names) for (ci, pos), names in fixer.missingResidues.items() if ci == chain.index),
+            key=lambda x: x[0],
+        )
+
+        gen_resnums = set()
+        for pos, names in gaps:
+            gap_len = len(names)
+            if pos == 0:
+                start = _parse_resnum(residues[0].id) - gap_len
+            else:
+                prev_resnum = _parse_resnum(residues[pos - 1].id)
+                start = prev_resnum + 1
+            end = start + gap_len - 1
+            for resnum in range(start, end + 1):
+                gen_resnums.add(resnum)
+
+        if gen_resnums:
+            generated_resnums_dict[cid] = gen_resnums
+
+    return pdb_complex_residues, generated_resnums_dict
+
+
+def apply_sequence_recovery(original_pdb_path, rfdiffusion_pdb_path, work_dir, pdb_id,
+                             out_name="sequence_recovered.pdb", cache_dir=None):
+    """
+    RFdiffusion実行後(新規残基が全てGLYの状態)の複合体PDBに対して、
+    RCSB FASTAとの配列アラインメントに基づき正しいアミノ酸名を割り当てる。
+
+    RFdiffusionはバックボーンのみを生成するモデルであり配列を設計しないため、
+    「どの残基がRFdiffusionにより新規生成されたか」の判定は、RFdiffusion実行前
+    の元PDB(missing residueの情報が残っている状態)を使って行う必要がある。
+
+    :param original_pdb_path: RFdiffusion実行前の(欠損が残っている)元のPDB
+    :param rfdiffusion_pdb_path: RFdiffusionの出力をマージ済みの複合体PDB(新規残基はGLY)
+    :param work_dir: 出力先ディレクトリ
+    :param pdb_id: RCSB FASTAを取得するためのPDB ID
+    :param out_name: 出力ファイル名
+    :param cache_dir: FASTAキャッシュディレクトリ(任意)
+    :return: 配列復元後のPDBファイルパス。復元対象がない場合はrfdiffusion_pdb_pathをそのまま返す。
+    """
+    pdb_complex_residues, generated_resnums_dict = _get_generated_resnums_from_original(original_pdb_path)
+
+    if not generated_resnums_dict or not pdb_id:
+        return rfdiffusion_pdb_path
+
+    fasta_text = fetch_rcsb_fasta(pdb_id, cache_dir=cache_dir)
+    fasta_sequences = parse_rcsb_fasta(fasta_text)
+
+    complex_corrections = recover_complex_sequences(
+        pdb_complex_residues=pdb_complex_residues,
+        generated_resnums_dict=generated_resnums_dict,
+        fasta_sequences=fasta_sequences,
+    )
+
+    if not complex_corrections:
+        return rfdiffusion_pdb_path
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("seqrec", rfdiffusion_pdb_path)
+    model = structure[0]
+
+    for cid, resnum_to_resname in complex_corrections.items():
+        if cid not in model:
+            continue
+        chain = model[cid]
+        for resnum, correct_resname in resnum_to_resname.items():
+            for res in chain:
+                if res.id[1] == resnum and res.id[0] == " ":
+                    res.resname = correct_resname
+                    break
+
+    out_path = os.path.join(work_dir, out_name)
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(out_path)
+
+    return out_path
 
 
 def map_generated_residues_to_sequence(chain_id, orig_chain_residues, generated_resnums, fasta_sequences):
