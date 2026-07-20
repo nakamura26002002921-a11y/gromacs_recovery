@@ -173,7 +173,12 @@ def _build_optimized_contig(valid_resnums, missing_regions, chain_id):
             gap_len = e - s + 1
             tokens.append(f"{gap_len}-{gap_len}")
 
-    contig = ",".join(tokens)
+    # RFdiffusionのcontig記法では、同一鎖内で既存領域と新規生成領域を
+    # 連結する際の区切りは "," ではなく "/" を使う仕様
+    # (rfdiffusion/contigs.py: get_sampled_mask() 内で
+    #  `contig_list = self.contigs[0].strip().split()` によりスペースで分割された
+    #  各要素は、さらに `subcons = con.split("/")` でスラッシュ区切りに分解される)
+    contig = "/".join(tokens)
 
     return contig
 
@@ -286,7 +291,7 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
             f"inference.output_prefix={out_prefix}",
             f"inference.input_pdb={os.path.abspath(clean_pdb_path)}",
             f"inference.model_directory_path={rf_config['model_directory_path']}",
-            f'contigmap.contigs=["{contig}"]',   # ← ここを修正
+            f'contigmap.contigs=["{contig}"]',
             f"inference.num_designs={rf_config.get('num_designs', 1)}",
         ]
             
