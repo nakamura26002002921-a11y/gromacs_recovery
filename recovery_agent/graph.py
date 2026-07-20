@@ -13,6 +13,7 @@ from .repair import get_repair_candidates
 from .utils import run_with_timeout
 from .missing_residues import count_missing_residues
 from .rfdiffusion_repair import run_rfdiffusion
+from .sequence_recovery import apply_sequence_recovery
 
 
 class RecoveryState(TypedDict, total=False):
@@ -69,13 +70,29 @@ def build_graph(config):
         return out_path
 
     def rfdiffusion_node(state):
-        # run_rfdiffusion()は「新規生成された欠損部分だけ」を元の全原子構造に差し込んだPDBを返すが、
-        # その新規部分はバックボーン原子(N,CA,C,O)しか持たないため、側鎖原子を補完する必要がある
-        merged_pdb = run_rfdiffusion(
-            state["pdb_path"], state["work_dir"], rf_config,
-            pdb_id=state.get("pdb_id"),          # ← 追加
+        # 【正しい2段階パイプライン】
+        # 1. RFdiffusion: バックボーン(N,CA,C,O)のみを生成する構造生成モデル。
+        #    公式仕様により、新規生成された残基は側鎖を持たず常にGLYとして出力される
+        #    (側鎖予測には損失が適用されておらず信頼できないため)。
+        # 2. sequence_recovery: RFdiffusionとは独立したステップとして、RCSB FASTAとの
+        #    アラインメントにより、新規生成された各残基の「あるべきアミノ酸種」を推定し、
+        #    GLYだった残基名をそのアミノ酸名に置き換える(座標自体はまだGLY相当のまま)。
+        # 3. PDBFixerで、置き換え後の残基名に対応する側鎖原子を補完する。
+        original_pdb_path = state["pdb_path"]
+
+        backbone_pdb = run_rfdiffusion(
+            original_pdb_path, state["work_dir"], rf_config,
         )
-        filled_pdb = _fill_missing_atoms(merged_pdb, state["work_dir"], "rfdiffusion_filled.pdb")
+
+        recovered_pdb = apply_sequence_recovery(
+            original_pdb_path=original_pdb_path,
+            rfdiffusion_pdb_path=backbone_pdb,
+            work_dir=state["work_dir"],
+            pdb_id=state.get("pdb_id"),
+            cache_dir=rf_config.get("fasta_cache_dir"),
+        ) if rf_config.get("reassign_sequence_from_fasta") else backbone_pdb
+
+        filled_pdb = _fill_missing_atoms(recovered_pdb, state["work_dir"], "rfdiffusion_filled.pdb")
         return {"pdb_path": filled_pdb}
 
     def pdbfixer_node(state):
