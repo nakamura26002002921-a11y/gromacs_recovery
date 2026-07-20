@@ -1,4 +1,15 @@
 # recovery_agent/rfdiffusion_repair.py
+#
+# 【重要】RFdiffusionはバックボーン(N, CA, C, O)のみを生成するモデルであり、
+# アミノ酸配列(側鎖)は設計しない。公式ドキュメントの通り、設計された残基は
+# 常にポリグリシン(GLY)として出力される。これはバグではなく仕様であり、
+# 側鎖の座標に対して損失が適用されていないため、そのまま信頼できるアミノ酸種
+# として扱ってはならない。
+#
+# したがって本モジュールの責務はRFdiffusionによるバックボーン生成と、
+# 生成された新規残基(常にGLY)を複合体PDBへマージすることのみに限定する。
+# 実際のアミノ酸配列の推定・割り当ては別ステップとして sequence_recovery.py
+# 側で行う(オーケストレーションは graph.py を参照)。
 import os
 import subprocess
 import re
@@ -6,12 +17,6 @@ import pickle
 import numpy as np
 from Bio.PDB import PDBParser, PDBIO, Structure, Model
 from pdbfixer import PDBFixer
-
-from recovery_agent.sequence_recovery import (
-    fetch_rcsb_fasta, 
-    parse_rcsb_fasta, 
-    recover_complex_sequences
-)
 
 # GPUメモリの断片化を防ぐためのPyTorch環境変数設定
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -172,10 +177,15 @@ def _build_optimized_contig_and_seq(valid_resnums, missing_regions, chain_id):
     return contig, provide_seq
 
 
-def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, target_cid, regions, corrections, out_path):
+def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, target_cid, regions, out_path):
     """
     RFdiffusionで生成された単一鎖の新規残基座標を、全体の複合体PDBにマージ（移植）する。
-    同時にFASTA由来の正しいアミノ酸名を割り当てる。
+
+    RFdiffusionはバックボーンのみを設計するモデルであり、側鎖・配列の推定は
+    行わない(公式仕様により常にGLYとして出力される)。そのため、ここでは
+    生成された残基をそのままGLYとして複合体PDBに移植するだけにとどめ、
+    アミノ酸名の再割り当ては行わない。正しい配列の推定・上書きは、この関数の
+    呼び出し元とは別の後続ステップ(sequence_recovery.py)の責務とする。
     """
     with open(trb_path, "rb") as f:
         trb = pickle.load(f)
@@ -221,11 +231,11 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
             
         new_res = hal_res.copy()
         new_res.id = (" ", resnum, " ")
-        
-        # FASTAから取得した正しいアミノ酸名を設定
-        correct_resname = corrections.get(target_cid, {}).get(resnum, "GLY")
-        new_res.resname = correct_resname
-        
+
+        # RFdiffusionはバックボーンのみ設計するため、新規残基は常にGLYのまま
+        # 複合体PDBへ移植する(側鎖・配列の推定は後続の sequence_recovery ステップで行う)
+        new_res.resname = "GLY"
+
         target_chain.add(new_res)
         
     target_chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))
@@ -238,6 +248,14 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
 def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
     """
     メイン・エントリポイント。
+
+    欠損領域のバックボーンをRFdiffusionで生成し、複合体PDBへマージして返す。
+    生成された新規残基は常にGLY(公式仕様どおりバックボーンのみ・配列は未設計)
+    のままとなる。pdb_id / FASTAを用いた配列の復元はここでは行わない
+    (呼び出し側で sequence_recovery.py を後段に実行すること)。
+
+    :param pdb_id: 後方互換のため引数として残しているが、本関数内では未使用。
+        配列復元に使うpdb_idは graph.py 側で sequence_recovery ステップに渡す。
     """
     fixer = PDBFixer(filename=pdb_path)
     fixer.findMissingResidues()
@@ -246,16 +264,6 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
 
     if not missing_regions:
         return pdb_path
-
-    complex_corrections = {}
-    if pdb_id and rf_config.get("reassign_sequence_from_fasta") and generated_resnums_dict:
-        fasta_text = fetch_rcsb_fasta(pdb_id, cache_dir=rf_config.get("fasta_cache_dir"))
-        fasta_sequences = parse_rcsb_fasta(fasta_text)
-        complex_corrections = recover_complex_sequences(
-            pdb_complex_residues=pdb_complex_residues,
-            generated_resnums_dict=generated_resnums_dict,
-            fasta_sequences=fasta_sequences
-        )
 
     current_complex_pdb = pdb_path
     
@@ -297,10 +305,10 @@ def run_rfdiffusion(pdb_path, work_dir, rf_config, pdb_id=None):
         if not os.path.exists(hal_pdb_path) or not os.path.exists(trb_path):
             raise RuntimeError(f"RFdiffusion output files missing for chain {cid}")
         
-        # 4. 修復された鎖の一部（新規残基）を、複合体PDBにマージ (正解配列もここで反映)
+        # 4. 修復された鎖の一部（新規残基, GLYのまま）を、複合体PDBにマージ
         next_complex_pdb = os.path.join(work_dir, f"merged_step_chain_{cid}.pdb")
         _merge_single_chain_to_complex(
-            current_complex_pdb, hal_pdb_path, trb_path, cid, regions, complex_corrections, next_complex_pdb
+            current_complex_pdb, hal_pdb_path, trb_path, cid, regions, next_complex_pdb
         )
         
         current_complex_pdb = next_complex_pdb
