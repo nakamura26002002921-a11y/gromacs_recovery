@@ -14,6 +14,7 @@ from .utils import run_with_timeout
 from .missing_residues import count_missing_residues
 from .rfdiffusion_repair import run_rfdiffusion
 from .sequence_recovery import apply_sequence_recovery
+from .modeller_minimize import minimize_with_modeller
 
 
 class RecoveryState(TypedDict, total=False):
@@ -26,6 +27,7 @@ class RecoveryState(TypedDict, total=False):
     stderr: str
     success: bool
     status: str
+    original_pdb_path: str
 
 
 def _extract_context(fatal_text):
@@ -52,12 +54,18 @@ def build_graph(config):
     obs = ObservationModule(config["gromacs"]["force_field"], config["gromacs"]["water_model"])
     rf_config = config.get("rfdiffusion", {})
     rf_threshold = rf_config.get("min_residues_for_rfdiffusion", 6)
+    modeller_config = config.get("modeller", {})
     max_attempts = config["agent"]["max_attempts"]
     repair_timeout = config["agent"].get("repair_timeout_sec", 300)
 
     # --- ノード ---
     def check_missing(state):
-        return {"missing_count": count_missing_residues(state["pdb_path"])}
+        # 極小化ノードで「どの残基が今回の修復で新規追加/補完されたか」を再判定するために、
+        # 欠損情報がまだ残っている元PDBのパスをstateに保持しておく。
+        return {
+            "missing_count": count_missing_residues(state["pdb_path"]),
+            "original_pdb_path": state["pdb_path"],
+        }
 
     def _fill_missing_atoms(pdb_path, work_dir, out_name):
         fixer = PDBFixer(filename=pdb_path)
@@ -98,6 +106,29 @@ def build_graph(config):
     def pdbfixer_node(state):
         out_path = _fill_missing_atoms(state["pdb_path"], state["work_dir"], "pdbfixer_filled.pdb")
         return {"pdb_path": out_path}
+
+    def modeller_minimize_node(state):
+        # RFdiffusion経路(6残基以上)・PDBFixer経路(1〜5残基)のどちらから来た場合でも、
+        # pdb2gmxに渡す直前に、新規生成/補完された残基とその近傍のみをMODELLERで
+        # 局所的にエネルギー極小化する。側鎖の衝突や不自然な結合長/角度を緩和し、
+        # pdb2gmxがクラッシュ原子で失敗する確率を下げるための最終仕上げステップ。
+        #
+        # MODELLERの最適化は入力構造によっては長時間かかる/収束しないことがあるため、
+        # repair系ノードと同様に別プロセス+タイムアウトで保護する。
+        timeout_sec = modeller_config.get("timeout_sec", 600)
+        result = run_with_timeout(
+            minimize_with_modeller,
+            args=(state["original_pdb_path"], state["pdb_path"], state["work_dir"], modeller_config),
+            kwargs={},
+            timeout_sec=timeout_sec,
+        )
+        # run_with_timeoutは本来repairノード用の結果dict形式を期待するが、
+        # minimize_with_modellerは文字列(パス)を直接返すため、成功時はそのまま使う。
+        if isinstance(result, dict) and result.get("status") in ("repair_timeout", "repair_error"):
+            print(f"[Warning] MODELLER minimization failed/timed out: {result.get('error')}. "
+                  f"Falling back to un-minimized structure.")
+            return {"pdb_path": state["pdb_path"]}
+        return {"pdb_path": result}
 
     def pdb2gmx_node(state):
         result = obs.run_pdb2gmx(state["pdb_path"], state["work_dir"], additional_flags=state.get("extra_flags"))
@@ -162,6 +193,7 @@ def build_graph(config):
     graph.add_node("check_missing", check_missing)
     graph.add_node("rfdiffusion", rfdiffusion_node)
     graph.add_node("pdbfixer", pdbfixer_node)
+    graph.add_node("modeller_minimize", modeller_minimize_node)
     graph.add_node("pdb2gmx", pdb2gmx_node)
     graph.add_node("diagnosis", diagnosis_node)
 
@@ -170,8 +202,9 @@ def build_graph(config):
         "check_missing", route_missing,
         {"rfdiffusion": "rfdiffusion", "pdbfixer": "pdbfixer", "pdb2gmx": "pdb2gmx"},
     )
-    graph.add_edge("rfdiffusion", "pdb2gmx")   # G: PDB更新 -> D
-    graph.add_edge("pdbfixer", "pdb2gmx")      # G: PDB更新 -> D
+    graph.add_edge("rfdiffusion", "modeller_minimize")   # G: PDB更新 -> 極小化 -> D
+    graph.add_edge("pdbfixer", "modeller_minimize")      # G: PDB更新 -> 極小化 -> D
+    graph.add_edge("modeller_minimize", "pdb2gmx")
     graph.add_conditional_edges("pdb2gmx", route_pdb2gmx, {"end": END, "diagnosis": "diagnosis"})
     graph.add_conditional_edges("diagnosis", route_diagnosis, {"end": END, "pdb2gmx": "pdb2gmx"})
 
