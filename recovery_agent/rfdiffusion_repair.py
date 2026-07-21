@@ -198,27 +198,22 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
 
     # 【重要】RFdiffusionのcontigs.py (get_mappings) の仕様により、
     # con_hal_pdb_idx に格納されるhal側チェーンIDは、入力PDBの実際のチェーン文字
-    # (例: 'B') とは無関係に、常に chain_order[0]='A' から採番される
-    # (expand_sampled_mask() の inpaint_hal.extend([(chain_order[inpaint_chain_idx], i)...]) を参照)。
-    # 単一鎖のinpaintingでは元のチェーンが 'A' か 'B' かによらず常にこの採番になるため、
-    # チェーン文字同士を突き合わせる判定は信頼できない(元チェーンが 'A' の場合のみ
-    # たまたま一致して見えてしまう)。
+    # (例: 'B') と一致するとは限らない。当初「常に chain_order[0]='A' になる」
+    # という前提で実装したが、実データで検証したところ
+    #   - trb (con_hal_pdb_idx) 側のchain_id: 'A'
+    #   - 実際に出力された rf_out_chain_B_0.pdb のchain_id: 'B'
+    # という食い違いが実際に発生することが判明した(chain Aの処理では
+    # たまたま両者が一致していたため、この不一致に気づけなかった)。
+    # trbのchain_id文字列がRFdiffusionの内部バージョンや設定によって
+    # 入力のchain_idと一致したりしなかったりするため、trb側のchain_id情報は
+    # 一切信用しない方針に変更する。
     #
-    # 【バグ修正】以前の実装は「hal側で"既存(kept)"に含まれない残基を、
-    # ファイル中の出現順のまま expected_missing_slots (実座標のresnum昇順リスト)
-    # とzip()で1対1対応させる」という位置ベースの対応付けを行っていた。
-    # これは、hal側の「既存として保持された残基の個数」が実座標側の
-    # 「欠損領域直前までの既存残基の実resnum」と必ず一致する、という誤った前提に
-    # 依存しており、鎖内に他の欠損・除去済み残基(_clean_and_extract_chain_pdbで
-    # CA欠損などにより間引かれた残基等)が1つでもあると、生成された残基全体が
-    # 1つズレて隣の実resnumに移植されてしまう(個数は一致するため例外は発生しない)。
-    #
-    # 正しい対応付けは、trbが直接提供する con_ref_pdb_idx <-> con_hal_pdb_idx の
-    # ペア(「hal側のこの残基は実座標側のこの残基からコピーされた」という一次情報)
-    # を「既存(kept)」判定に使い、そこに含まれないhal残基だけを新規生成として扱う。
-    # さらに、新規生成領域をhal側resnumの昇順で並べ、real側のexpected_missing_slots
-    # と対応付けることで、real側とhal側どちらの数値配列も「昇順・連続」という
-    # 保証された性質のみに依拠するようにする(ズレの起きようがない対応付け)。
+    # 本モジュールは常に単一鎖のみをRFdiffusionへ入力しているため、
+    # hal出力PDB(rf_out_chain_X_0.pdb)には実際には常にちょうど1本の
+    # chainしか存在しない。そこで「hal側のchain_idが何であるか」を
+    # trbから読むのではなく、hal_struct自体から直接検出し、
+    # kept判定・対応付けはresnumのみで行う(単一鎖なのでresnumの衝突は
+    # 起こり得ない)。
     con_ref_pdb_idx = trb.get("con_ref_pdb_idx", [])
     con_hal_pdb_idx = trb.get("con_hal_pdb_idx", [])
     if len(con_ref_pdb_idx) != len(con_hal_pdb_idx):
@@ -228,29 +223,41 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
             f"cannot reliably map kept residues."
         )
 
-    # kept (既存として保持された) hal側 (chain_id, resnum) の集合。
-    # con_hal_pdb_idx の値は (chain_id, resnum) のタプルなので、resnumだけでなく
-    # chain_idも含めてキーにする(hal側は複数チェーンに分かれることがあるため、
-    # resnumだけで判定すると別チェーンの同一resnumと衝突しうる)。
-    kept_hal_keys = {(v[0], v[1]) for v in con_hal_pdb_idx}
+    # kept (既存として保持された) hal側resnumの集合。
+    # 【バグ修正】trbファイル中のresnumは numpy.int64 で格納されている一方、
+    # Bio.PDBがPDBファイルをパースして得る res.id[1] はPython標準のint。
+    # np.int64(5) == 5 はTrueだが、辞書やsetのキーとして
+    # (chain_id, np.int64(5)) と (chain_id, 5) は必ずしも同一キーとして
+    # 扱われる保証がない。加えてchain_idそのものが上記の理由で信用できない
+    # ため、以降は resnumのみ(int変換済み)をキーとして扱う。
+    kept_hal_resnums = {int(v[1]) for v in con_hal_pdb_idx}
 
-    # kept残基について real側resnum -> hal側(chain_id, resnum) の対応も保持しておく
+    # kept残基について real側resnum -> hal側resnum の対応も保持しておく
+    # (chain_idは使わない。理由は上記コメント参照)
     hal_by_real = {}
     for (ref_chain, ref_resnum), (hal_chain, hal_resnum) in zip(con_ref_pdb_idx, con_hal_pdb_idx):
-        hal_by_real[int(ref_resnum)] = (hal_chain, int(hal_resnum))
+        hal_by_real[int(ref_resnum)] = int(hal_resnum)
 
     parser = PDBParser(QUIET=True)
     complex_struct = parser.get_structure("cpx", current_complex_pdb)
     hal_struct = parser.get_structure("hal", hal_pdb_path)
     target_chain = complex_struct[0][target_cid]
 
-    # hal構造の全残基を (chain_id, resnum) -> Residue の辞書にしておく
+    hal_chains = list(hal_struct[0])
+    if len(hal_chains) != 1:
+        raise RuntimeError(
+            f"Chain {target_cid}: expected exactly 1 chain in hal output PDB "
+            f"({hal_pdb_path}), but found {len(hal_chains)} "
+            f"({[c.id for c in hal_chains]}). This module assumes single-chain "
+            f"RFdiffusion runs; cannot safely resolve which residues are kept."
+        )
+
+    # hal構造の唯一のchainの全残基を resnum -> Residue の辞書にしておく
     # (Superimposerの対応点探しと、新規生成残基の抽出の両方で使う)
-    hal_res_by_key = {}
-    for chain in hal_struct[0]:
-        for res in chain:
-            if res.id[0] == " ":
-                hal_res_by_key[(chain.id, res.id[1])] = res
+    hal_res_by_resnum = {}
+    for res in hal_chains[0]:
+        if res.id[0] == " ":
+            hal_res_by_resnum[int(res.id[1])] = res
 
     # =====================================================================
     # 【座標系のアライメント】
@@ -262,9 +269,9 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
     # =====================================================================
     ref_atoms = []
     hal_atoms = []
-    for ref_resnum, hal_key in hal_by_real.items():
+    for ref_resnum, hal_resnum in hal_by_real.items():
         ref_id = (" ", ref_resnum, " ")
-        hal_res = hal_res_by_key.get(hal_key)
+        hal_res = hal_res_by_resnum.get(hal_resnum)
         if hal_res is None:
             continue
         if ref_id in target_chain and "CA" in target_chain[ref_id] and "CA" in hal_res:
@@ -282,14 +289,13 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
               f"superimpose (found {len(ref_atoms)}); merging without alignment.")
 
     # hal出力から「新規生成された残基」のみを抽出し、hal側resnumの昇順に並べる
-    # (ファイル中の出現順に依存しない)
+    # (ファイル中の出現順に依存しない。単一鎖なのでresnumのみで判定できる)
     newly_generated_hal_residues = []
-    for chain in hal_struct[0]:
-        for res in chain:
-            if res.id[0] != " ":
-                continue
-            if (chain.id, res.id[1]) not in kept_hal_keys:
-                newly_generated_hal_residues.append(res)
+    for res in hal_chains[0]:
+        if res.id[0] != " ":
+            continue
+        if int(res.id[1]) not in kept_hal_resnums:
+            newly_generated_hal_residues.append(res)
     newly_generated_hal_residues.sort(key=lambda r: r.id[1])
 
     # 複合体PDBの挿入先スロットを算出
@@ -317,15 +323,14 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
 
         prev_real_resnum = start_res - 1
         if prev_real_resnum in hal_by_real:
-            expected_prev_hal_chain, expected_prev_hal_resnum = hal_by_real[prev_real_resnum]
+            expected_prev_hal_resnum = hal_by_real[prev_real_resnum]
             actual_first_hal = block[0].id[1]
             if actual_first_hal != expected_prev_hal_resnum + 1:
                 raise RuntimeError(
                     f"Chain {target_cid}: hal numbering discontinuity detected before gap "
                     f"{start_res}-{end_res}. Residue {prev_real_resnum} (real) maps to hal "
-                    f"resnum {expected_prev_hal_resnum} (chain {expected_prev_hal_chain}), but the "
-                    f"newly-generated block starts at hal resnum {actual_first_hal} "
-                    f"(expected {expected_prev_hal_resnum + 1}). "
+                    f"resnum {expected_prev_hal_resnum}, but the newly-generated block starts "
+                    f"at hal resnum {actual_first_hal} (expected {expected_prev_hal_resnum + 1}). "
                     f"Refusing to merge to avoid silently misassigning generated residues."
                 )
 
