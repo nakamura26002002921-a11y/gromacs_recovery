@@ -74,7 +74,15 @@ def build_graph(config):
         fixer.addMissingAtoms()
         out_path = os.path.join(work_dir, out_name)
         with open(out_path, "w") as f:
-            PDBFile.writeFile(fixer.topology, fixer.positions, f)
+            # 【重要】keepIds=True を必ず指定すること。
+            # デフォルト(keepIds=False)では、OpenMMが元のPDBのチェーンID・残基番号を
+            # 完全に無視し、トポロジー内の出現順に基づいて A,B,C... / 1,2,3... と
+            # 振り直してしまう(openmm/app/pdbfile.py の writeModel を参照)。
+            # これにより、RFdiffusionでマージした際の残基番号(例: 2-548)が
+            # 1-547 のような別の番号体系に化けてしまい、後続の MODELLER 残基選択
+            # (_get_repaired_resnums は元の番号を前提に計算する)や、GROMACSトポロジー、
+            # sequence_recovery結果との整合性が全て崩れる。
+            PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
         return out_path
 
     def rfdiffusion_node(state):
