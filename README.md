@@ -18,7 +18,7 @@ graph TD
     Check -->|1〜5残基| PDBFix["局所修復<br>repair.py (PDBFixer)"]
     Check -->|0残基| RunGmx["pdb2gmx実行<br>observation.py"]
 
-    RFDiff --> Merge["構造マージ<br>rfdiffusion_repair.py<br>（GLYのまま複合体PDBへ統合）"]
+    RFDiff --> Merge["構造マージ<br>rfdiffusion_repair.py<br>（Superimposerで座標系を整合後、GLYのまま複合体PDBへ統合）"]
     Merge --> SeqRec["② 配列復元<br>sequence_recovery.py<br>（FASTAとのアライメントでGLY→正しい残基名に置換）"]
     SeqRec --> FillAtoms["③ 側鎖原子補完<br>PDBFixer<br>（置換後の残基名に対応する側鎖を生成）"]
 
@@ -240,9 +240,11 @@ else:
 
 ## 🔍 4. トラブルシューティング
 
-本エージェントは、実データの PDB フォーマット特有の罠に対して以下の**堅牢な対策をコードレベルで実装済み**です。
+本エージェントは、実データの PDB フォーマット特有の罠、および RFdiffusion の出力特性に起因する罠に対して以下の**堅牢な対策をコードレベルで実装済み**です。
 - ✅ **挿入コード (Insertion Code) 対策**: `_parse_resnum` により `100A` のような残基IDでも数値部分を安全に抽出。
-- ✅ **`.trb` パースエラー対策**: `con_hal_pdb_idx` の文字列リストを安全にスライスして分解。
+- ✅ **座標系のアライメント (Superimposer)**: RFdiffusionの出力(hal構造)は入力複合体全体に対して数十Å規模の並進オフセットを持って出力されることが実測で確認されている。マージ前に `con_ref_pdb_idx`/`con_hal_pdb_idx` から得られるkept残基のCA原子ペアを用いて `Bio.PDB.Superimposer` でhal構造全体を複合体の座標系へ重ね合わせてから移植することで、ペプチド結合の破綻を防ぐ。
+- ✅ **hal側チェーンIDの不一致対策**: `.trb` の `con_hal_pdb_idx` に記録されるchain_idは、実際のhal出力PDBファイル内のchain_idと一致するとは限らない（RFdiffusionのバージョン・設定により挙動が変わりうることを実データで確認済み）。本エージェントはtrb由来のchain_id文字列を一切信用せず、hal出力PDBが単一鎖であることを検証したうえでresnumのみによる対応付けを行う。
+- ✅ **kept領域の位置ベース対応付けバグの排除**: 「hal側で既存に含まれない残基を出現順のままreal側のresnum昇順リストとzip()で対応付ける」という以前の実装は、個数が一致していても対応がズレる場合があり、件数一致のみでは検出できない誤マージを招いていた。現在は `con_ref_pdb_idx`/`con_hal_pdb_idx` が提供する一次対応情報から生成ブロックの開始位置を直接検証し、ズレを検知した場合は黙って移植せず `RuntimeError` を送出する。
 - ✅ **HETATM 重複除去**: RFdiffusion 統合時、同一残基番号を持つ水分子等の HETATM を自動的に一掃。
 
 それでも問題が発生した場合は以下を確認してください。
@@ -253,6 +255,8 @@ else:
 | `ModuleNotFoundError: No module named 'rfdiffusion'` | `environment.yml` で定義された環境が正しく activate されているか確認してください。 |
 | `pdb2gmx` が毎回同じエラーで失敗し、`failed_no_candidates` になる | `log/recovery.log` を確認し、`diagnosis.py` の分類ルールに該当事象が定義されているか確認してください。 |
 | RFdiffusion がタイムアウトする | `config.yaml` の `timeout_sec` を延長するか、GPU のメモリ不足 (`CUDA out of memory`) が発生していないか確認してください。 |
+| `[Warning] Chain X: not enough kept CA atoms to superimpose` | kept残基のCAペアが3点未満で座標系アライメントができていません。マージ後の構造でペプチド結合が破綻している可能性が高いため、当該鎖の `.trb` の `con_ref_pdb_idx`/`con_hal_pdb_idx` の対応件数を確認してください。 |
+| `RuntimeError: ... hal numbering discontinuity detected ...` | kept領域とRFdiffusion生成領域の対応付けにズレが検出され、安全のためマージを中断しています。黙って誤マージするより安全な停止であり、`.trb` の内容と欠損領域の算出結果 (`missing_residues.py`) を突き合わせて原因を確認してください。 |
 
 ---
 
@@ -266,7 +270,7 @@ gromacs_recovery/
 ├── recovery_agent/
 │   ├── graph.py                     # LangGraph による修復フロー本体（①RFdiffusion→②配列復元→③側鎖補完を統括）
 │   ├── missing_residues.py          # 欠損残基数のカウント（分岐閾値の判定自体は graph.py 側）
-│   ├── rfdiffusion_repair.py        # RFdiffusion 呼び出し・構造マージ（バックボーンのみ生成、新規残基は常にGLY）
+│   ├── rfdiffusion_repair.py        # RFdiffusion 呼び出し・構造マージ（バックボーンのみ生成、新規残基は常にGLY。Superimposerによる座標系アライメントとresnumベースの厳密な対応付けを実施）
 │   ├── sequence_recovery.py         # MM-align的思想に基づくグローバル配列復元（RFdiffusion実行後の独立ステップ）
 │   ├── modeller_minimize.py         # MODELLERによる局所エネルギー極小化（RFdiffusion/PDBFixer両経路の仕上げ）
 │   ├── observation.py               # gmx pdb2gmx の実行と出力キャプチャ
