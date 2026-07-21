@@ -15,7 +15,7 @@ import subprocess
 import re
 import pickle
 import numpy as np
-from Bio.PDB import PDBParser, PDBIO, Structure, Model
+from Bio.PDB import PDBParser, PDBIO, Structure, Model, Superimposer
 from pdbfixer import PDBFixer
 
 # GPUメモリの断片化を防ぐためのPyTorch環境変数設定
@@ -203,22 +203,94 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
     # 単一鎖のinpaintingでは元のチェーンが 'A' か 'B' かによらず常にこの採番になるため、
     # チェーン文字同士を突き合わせる判定は信頼できない(元チェーンが 'A' の場合のみ
     # たまたま一致して見えてしまう)。
-    # hal側の残基番号は1本のhal鎖内で連番かつユニークなので、番号のみで
-    # 「既存(kept)」領域かどうかを判定する。
-    kept_hal_resnums = {v[1] for v in trb.get("con_hal_pdb_idx", [])}
+    #
+    # 【バグ修正】以前の実装は「hal側で"既存(kept)"に含まれない残基を、
+    # ファイル中の出現順のまま expected_missing_slots (実座標のresnum昇順リスト)
+    # とzip()で1対1対応させる」という位置ベースの対応付けを行っていた。
+    # これは、hal側の「既存として保持された残基の個数」が実座標側の
+    # 「欠損領域直前までの既存残基の実resnum」と必ず一致する、という誤った前提に
+    # 依存しており、鎖内に他の欠損・除去済み残基(_clean_and_extract_chain_pdbで
+    # CA欠損などにより間引かれた残基等)が1つでもあると、生成された残基全体が
+    # 1つズレて隣の実resnumに移植されてしまう(個数は一致するため例外は発生しない)。
+    #
+    # 正しい対応付けは、trbが直接提供する con_ref_pdb_idx <-> con_hal_pdb_idx の
+    # ペア(「hal側のこの残基は実座標側のこの残基からコピーされた」という一次情報)
+    # を「既存(kept)」判定に使い、そこに含まれないhal残基だけを新規生成として扱う。
+    # さらに、新規生成領域をhal側resnumの昇順で並べ、real側のexpected_missing_slots
+    # と対応付けることで、real側とhal側どちらの数値配列も「昇順・連続」という
+    # 保証された性質のみに依拠するようにする(ズレの起きようがない対応付け)。
+    con_ref_pdb_idx = trb.get("con_ref_pdb_idx", [])
+    con_hal_pdb_idx = trb.get("con_hal_pdb_idx", [])
+    if len(con_ref_pdb_idx) != len(con_hal_pdb_idx):
+        raise RuntimeError(
+            f"Chain {target_cid}: con_ref_pdb_idx (len={len(con_ref_pdb_idx)}) and "
+            f"con_hal_pdb_idx (len={len(con_hal_pdb_idx)}) length mismatch in trb file; "
+            f"cannot reliably map kept residues."
+        )
+
+    # kept (既存として保持された) hal側 (chain_id, resnum) の集合。
+    # con_hal_pdb_idx の値は (chain_id, resnum) のタプルなので、resnumだけでなく
+    # chain_idも含めてキーにする(hal側は複数チェーンに分かれることがあるため、
+    # resnumだけで判定すると別チェーンの同一resnumと衝突しうる)。
+    kept_hal_keys = {(v[0], v[1]) for v in con_hal_pdb_idx}
+
+    # kept残基について real側resnum -> hal側(chain_id, resnum) の対応も保持しておく
+    hal_by_real = {}
+    for (ref_chain, ref_resnum), (hal_chain, hal_resnum) in zip(con_ref_pdb_idx, con_hal_pdb_idx):
+        hal_by_real[int(ref_resnum)] = (hal_chain, int(hal_resnum))
 
     parser = PDBParser(QUIET=True)
     complex_struct = parser.get_structure("cpx", current_complex_pdb)
     hal_struct = parser.get_structure("hal", hal_pdb_path)
+    target_chain = complex_struct[0][target_cid]
 
-    # hal出力から「新規生成された残基」のみを抽出
+    # hal構造の全残基を (chain_id, resnum) -> Residue の辞書にしておく
+    # (Superimposerの対応点探しと、新規生成残基の抽出の両方で使う)
+    hal_res_by_key = {}
+    for chain in hal_struct[0]:
+        for res in chain:
+            if res.id[0] == " ":
+                hal_res_by_key[(chain.id, res.id[1])] = res
+
+    # =====================================================================
+    # 【座標系のアライメント】
+    # RFdiffusionの出力(hal)は、入力複合体全体に対して並進・回転している
+    # ことがある(measure_shift.pyで実測: 回転はほぼ無視できるが並進が
+    # 数十Å規模で乗ることを確認済み)。kept(維持された)残基のCA原子同士を
+    # 基準に hal_struct 全体を complex_struct の座標系へ重ね合わせてから
+    # 新規残基を移植しないと、ペプチド結合が破綻した状態でマージされる。
+    # =====================================================================
+    ref_atoms = []
+    hal_atoms = []
+    for ref_resnum, hal_key in hal_by_real.items():
+        ref_id = (" ", ref_resnum, " ")
+        hal_res = hal_res_by_key.get(hal_key)
+        if hal_res is None:
+            continue
+        if ref_id in target_chain and "CA" in target_chain[ref_id] and "CA" in hal_res:
+            ref_atoms.append(target_chain[ref_id]["CA"])
+            hal_atoms.append(hal_res["CA"])
+
+    if len(ref_atoms) >= 3:
+        sup = Superimposer()
+        sup.set_atoms(ref_atoms, hal_atoms)
+        sup.apply(list(hal_struct[0].get_atoms()))
+        print(f"[Info] Chain {target_cid}: superimposed hal onto complex "
+              f"(kept CA pairs={len(ref_atoms)}, RMSD={sup.rms:.3f} Å)")
+    else:
+        print(f"[Warning] Chain {target_cid}: not enough kept CA atoms to "
+              f"superimpose (found {len(ref_atoms)}); merging without alignment.")
+
+    # hal出力から「新規生成された残基」のみを抽出し、hal側resnumの昇順に並べる
+    # (ファイル中の出現順に依存しない)
     newly_generated_hal_residues = []
     for chain in hal_struct[0]:
         for res in chain:
             if res.id[0] != " ":
                 continue
-            if res.id[1] not in kept_hal_resnums:
+            if (chain.id, res.id[1]) not in kept_hal_keys:
                 newly_generated_hal_residues.append(res)
+    newly_generated_hal_residues.sort(key=lambda r: r.id[1])
 
     # 複合体PDBの挿入先スロットを算出
     expected_missing_slots = []
@@ -232,8 +304,33 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
             f"but AI generated {len(newly_generated_hal_residues)}."
         )
 
+    # 【整合性チェック】各欠損領域の直前の実在残基(あれば)がkept mappingに
+    # 存在し、そのhal側resnumが「新規生成ブロックの開始位置の直前」に
+    # 連続しているかを検証する。ズレている場合は黙って移植せず、
+    # ここで検知してRuntimeErrorとする(以前のバグはここが無かったため
+    # 検出されずに1残基ズレたまま移植されていた)。
+    hal_idx_cursor = 0
+    for start_res, end_res in sorted(regions, key=lambda x: x[0]):
+        gap_len = end_res - start_res + 1
+        block = newly_generated_hal_residues[hal_idx_cursor:hal_idx_cursor + gap_len]
+        hal_idx_cursor += gap_len
+
+        prev_real_resnum = start_res - 1
+        if prev_real_resnum in hal_by_real:
+            expected_prev_hal_chain, expected_prev_hal_resnum = hal_by_real[prev_real_resnum]
+            actual_first_hal = block[0].id[1]
+            if actual_first_hal != expected_prev_hal_resnum + 1:
+                raise RuntimeError(
+                    f"Chain {target_cid}: hal numbering discontinuity detected before gap "
+                    f"{start_res}-{end_res}. Residue {prev_real_resnum} (real) maps to hal "
+                    f"resnum {expected_prev_hal_resnum} (chain {expected_prev_hal_chain}), but the "
+                    f"newly-generated block starts at hal resnum {actual_first_hal} "
+                    f"(expected {expected_prev_hal_resnum + 1}). "
+                    f"Refusing to merge to avoid silently misassigning generated residues."
+                )
+
     # 複合体PDBの対象チェーンへ外科的に移植し、正しい残基名を与える
-    target_chain = complex_struct[0][target_cid]
+    # (target_chainは上のSuperimposer準備時に既に取得済み)
     for resnum, hal_res in zip(expected_missing_slots, newly_generated_hal_residues):
         to_detach = [r.id for r in target_chain if r.id[1] == resnum and r.id[0] == " "]
         for rid in to_detach:
@@ -247,8 +344,17 @@ def _merge_single_chain_to_complex(current_complex_pdb, hal_pdb_path, trb_path, 
         new_res.resname = "GLY"
 
         target_chain.add(new_res)
-        
-    target_chain.child_list.sort(key=lambda r: (r.id[1], r.id[2]))
+
+    # target_chain.child_list.sort(...) のようにBiopythonの内部リストを直接
+    # ソートするのは非推奨(child_dictとの不整合を招く恐れがある)。
+    # 全残基を一度detachしてからソート順にaddし直す、正規のAPIのみに
+    # 依拠した安全な方法で並び順を揃える。
+    all_res = list(target_chain)
+    for res in all_res:
+        target_chain.detach_child(res.id)
+    all_res.sort(key=lambda r: (r.id[1], r.id[2]))
+    for res in all_res:
+        target_chain.add(res)
 
     io = PDBIO()
     io.set_structure(complex_struct)
