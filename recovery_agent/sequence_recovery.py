@@ -128,7 +128,12 @@ def recover_complex_sequences(pdb_complex_residues, generated_resnums_dict, fast
         gen_resnums = generated_resnums_dict.get(p_cid, set())
         
         # 残基番号を文字列としてソート
-        resnums_sorted = sorted(orig_residues.keys(), key=lambda x: str(x))
+        # 【重要】残基番号は必ず数値としてソートすること。
+        # 文字列としてソートする(例: key=str)と、桁数の異なる番号が混在した場合
+        # (例: "2", "100", "525")辞書式順序は数値順と一致せず(例: "100" < "2" < "525")、
+        # アラインメント結果(配列順)とPDB残基番号の対応が完全にズレてしまい、
+        # 誤ったアミノ酸名が復元される(実際に検証したところ復元精度が0%になっていた)。
+        resnums_sorted = sorted(orig_residues.keys(), key=_parse_resnum)
         sorted_resnums_dict[p_cid] = resnums_sorted
         
         if not resnums_sorted:
