@@ -8,7 +8,9 @@ def _save_fixer_output(fixer, step_num, op_name, work_dir):
     filename = f"step_{step_num}_{op_name}.pdb"
     new_pdb_path = os.path.join(work_dir, filename)
     with open(new_pdb_path, 'w') as f:
-        PDBFile.writeFile(fixer.topology, fixer.positions, f)
+        # graph.py の _fill_missing_atoms と同じ理由で keepIds=True が必須
+        # (デフォルトのkeepIds=Falseだと元のチェーンID・残基番号が失われる)
+        PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
     return new_pdb_path
 
 def pdbfixer_add_missing_atoms(pdb_path, step_num, work_dir, **kwargs):
