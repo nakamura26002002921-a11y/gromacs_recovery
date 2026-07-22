@@ -141,9 +141,11 @@ def build_graph(config):
     g.add_edge(START, "check_missing")
     g.add_conditional_edges("check_missing", route_missing,
                             {"rfdiffusion": "rfdiffusion", "pdbfixer": "pdbfixer", "pdb2gmx": "pdb2gmx"})
+    
     g.add_edge("rfdiffusion", "modeller_minimize")
     g.add_edge("pdbfixer", "modeller_minimize")
     g.add_edge("modeller_minimize", "pdb2gmx")
+
     g.add_conditional_edges("pdb2gmx", route_pdb2gmx, {"end": END, "diagnosis": "diagnosis"})
     g.add_conditional_edges("diagnosis", route_diagnosis, {"end": END, "pdb2gmx": "pdb2gmx"})
 
