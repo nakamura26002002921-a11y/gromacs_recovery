@@ -2,7 +2,6 @@
 import os
 import re
 from typing import TypedDict, List, Optional
-
 from langgraph.graph import StateGraph, START, END
 from pdbfixer import PDBFixer
 from openmm.app import PDBFile
@@ -28,6 +27,7 @@ class RecoveryState(TypedDict, total=False):
     success: bool
     status: str
     original_pdb_path: str
+    missing_count: int
 
 
 def _extract_context(fatal_text):
@@ -59,9 +59,8 @@ def build_graph(config):
     repair_timeout = config["agent"].get("repair_timeout_sec", 300)
 
     # --- ノード ---
+
     def check_missing(state):
-        # 極小化ノードで「どの残基が今回の修復で新規追加/補完されたか」を再判定するために、
-        # 欠損情報がまだ残っている元PDBのパスをstateに保持しておく。
         return {
             "missing_count": count_missing_residues(state["pdb_path"]),
             "original_pdb_path": state["pdb_path"],
@@ -74,41 +73,52 @@ def build_graph(config):
         fixer.addMissingAtoms()
         out_path = os.path.join(work_dir, out_name)
         with open(out_path, "w") as f:
-            # 【重要】keepIds=True を必ず指定すること。
-            # デフォルト(keepIds=False)では、OpenMMが元のPDBのチェーンID・残基番号を
-            # 完全に無視し、トポロジー内の出現順に基づいて A,B,C... / 1,2,3... と
-            # 振り直してしまう(openmm/app/pdbfile.py の writeModel を参照)。
-            # これにより、RFdiffusionでマージした際の残基番号(例: 2-548)が
-            # 1-547 のような別の番号体系に化けてしまい、後続の MODELLER 残基選択
-            # (_get_repaired_resnums は元の番号を前提に計算する)や、GROMACSトポロジー、
-            # sequence_recovery結果との整合性が全て崩れる。
             PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
         return out_path
 
     def rfdiffusion_node(state):
-        # 【正しい2段階パイプライン】
-        # 1. RFdiffusion: バックボーン(N,CA,C,O)のみを生成する構造生成モデル。
-        #    公式仕様により、新規生成された残基は側鎖を持たず常にGLYとして出力される
-        #    (側鎖予測には損失が適用されておらず信頼できないため)。
-        # 2. sequence_recovery: RFdiffusionとは独立したステップとして、RCSB FASTAとの
-        #    アラインメントにより、新規生成された各残基の「あるべきアミノ酸種」を推定し、
-        #    GLYだった残基名をそのアミノ酸名に置き換える(座標自体はまだGLY相当のまま)。
-        # 3. PDBFixerで、置き換え後の残基名に対応する側鎖原子を補完する。
+        """
+        【3段階パイプライン】
+        1. RFdiffusion: バックボーン生成 (新規残基はGLY)
+        2. sequence_recovery: GLY → 正しいアミノ酸名に置換
+        3. PDBFixer: 側鎖原子の補完
+        """
         original_pdb_path = state["pdb_path"]
+        work_dir = state["work_dir"]
+        pdb_id = state.get("pdb_id")
 
-        backbone_pdb = run_rfdiffusion(
-            original_pdb_path, state["work_dir"], rf_config,
-        )
+        # --- Step 1: RFdiffusion ---
+        print(f"[rfdiffusion_node] Step 1: RFdiffusion実行中...")
+        backbone_pdb = run_rfdiffusion(original_pdb_path, work_dir, rf_config)
+        print(f"[rfdiffusion_node] Step 1 完了: {backbone_pdb}")
 
-        recovered_pdb = apply_sequence_recovery(
-            original_pdb_path=original_pdb_path,
-            rfdiffusion_pdb_path=backbone_pdb,
-            work_dir=state["work_dir"],
-            pdb_id=state.get("pdb_id"),
-            cache_dir=rf_config.get("fasta_cache_dir"),
-        ) if rf_config.get("reassign_sequence_from_fasta") else backbone_pdb
+        # --- Step 2: 配列復元 ---
+        # 【修正】reassign_sequence_from_fasta が未設定でも pdb_id があれば実行する
+        should_recover = rf_config.get("reassign_sequence_from_fasta", True)
+        if should_recover and pdb_id:
+            print(f"[rfdiffusion_node] Step 2: 配列復元実行中 (pdb_id={pdb_id})...")
+            recovered_pdb = apply_sequence_recovery(
+                original_pdb_path=original_pdb_path,
+                rfdiffusion_pdb_path=backbone_pdb,
+                work_dir=work_dir,
+                pdb_id=pdb_id,
+                cache_dir=rf_config.get("fasta_cache_dir"),
+            )
+            if recovered_pdb != backbone_pdb:
+                print(f"[rfdiffusion_node] Step 2 完了: {recovered_pdb}")
+            else:
+                print(f"[rfdiffusion_node] Step 2: 配列復元スキップ (欠損なし or pdb_id未指定)")
+                recovered_pdb = backbone_pdb
+        else:
+            print(f"[rfdiffusion_node] Step 2: 配列復元スキップ "
+                  f"(reassign={should_recover}, pdb_id={pdb_id})")
+            recovered_pdb = backbone_pdb
 
-        filled_pdb = _fill_missing_atoms(recovered_pdb, state["work_dir"], "rfdiffusion_filled.pdb")
+        # --- Step 3: 側鎖補完 ---
+        print(f"[rfdiffusion_node] Step 3: 側鎖原子補完中...")
+        filled_pdb = _fill_missing_atoms(recovered_pdb, work_dir, "rfdiffusion_filled.pdb")
+        print(f"[rfdiffusion_node] Step 3 完了: {filled_pdb}")
+
         return {"pdb_path": filled_pdb}
 
     def pdbfixer_node(state):
@@ -116,30 +126,55 @@ def build_graph(config):
         return {"pdb_path": out_path}
 
     def modeller_minimize_node(state):
-        # RFdiffusion経路(6残基以上)・PDBFixer経路(1〜5残基)のどちらから来た場合でも、
-        # pdb2gmxに渡す直前に、新規生成/補完された残基とその近傍のみをMODELLERで
-        # 局所的にエネルギー極小化する。側鎖の衝突や不自然な結合長/角度を緩和し、
-        # pdb2gmxがクラッシュ原子で失敗する確率を下げるための最終仕上げステップ。
-        #
-        # MODELLERの最適化は入力構造によっては長時間かかる/収束しないことがあるため、
-        # repair系ノードと同様に別プロセス+タイムアウトで保護する。
-        timeout_sec = modeller_config.get("timeout_sec", 600)
-        result = run_with_timeout(
-            minimize_with_modeller,
-            args=(state["original_pdb_path"], state["pdb_path"], state["work_dir"], modeller_config),
-            kwargs={},
-            timeout_sec=timeout_sec,
-        )
-        # run_with_timeoutは本来repairノード用の結果dict形式を期待するが、
-        # minimize_with_modellerは文字列(パス)を直接返すため、成功時はそのまま使う。
-        if isinstance(result, dict) and result.get("status") in ("repair_timeout", "repair_error"):
-            print(f"[Warning] MODELLER minimization failed/timed out: {result.get('error')}. "
-                  f"Falling back to un-minimized structure.")
+        """
+        MODELLERによる局所エネルギー極小化。
+        config.yaml で modeller.enabled: false の場合はスキップ。
+        """
+        # 【修正】enabled チェックを追加
+        if not modeller_config.get("enabled", True):
+            print("[modeller_minimize] スキップ (modeller.enabled: false)")
             return {"pdb_path": state["pdb_path"]}
-        return {"pdb_path": result}
+
+        # ライセンスキーが未設定の場合はスキップ
+        license_key = modeller_config.get("license_key", "")
+        if not license_key or license_key == "YOUR-MODELLER-LICENSE-KEY":
+            print("[modeller_minimize] スキップ (MODELLERライセンスキー未設定)")
+            return {"pdb_path": state["pdb_path"]}
+
+        print(f"[modeller_minimize] 局所エネルギー極小化実行中...")
+        print(f"  元PDB: {state['original_pdb_path']}")
+        print(f"  入力PDB: {state['pdb_path']}")
+
+        timeout_sec = modeller_config.get("timeout_sec", 600)
+        try:
+            result = run_with_timeout(
+                minimize_with_modeller,
+                args=(state["original_pdb_path"], state["pdb_path"],
+                      state["work_dir"], modeller_config),
+                kwargs={},
+                timeout_sec=timeout_sec,
+            )
+        except Exception as e:
+            print(f"[modeller_minimize] 例外発生: {e}")
+            print(f"[modeller_minimize] 極小化なしで続行します。")
+            return {"pdb_path": state["pdb_path"]}
+
+        if isinstance(result, dict) and result.get("status") in ("repair_timeout", "repair_error"):
+            print(f"[modeller_minimize] 失敗/タイムアウト: {result.get('error')}")
+            print(f"[modeller_minimize] 極小化なしで続行します。")
+            return {"pdb_path": state["pdb_path"]}
+
+        if isinstance(result, str) and os.path.exists(result):
+            print(f"[modeller_minimize] 完了: {result}")
+            return {"pdb_path": result}
+
+        # 予期しない戻り値
+        print(f"[modeller_minimize] 予期しない戻り値: {type(result)}")
+        return {"pdb_path": state["pdb_path"]}
 
     def pdb2gmx_node(state):
-        result = obs.run_pdb2gmx(state["pdb_path"], state["work_dir"], additional_flags=state.get("extra_flags"))
+        result = obs.run_pdb2gmx(state["pdb_path"], state["work_dir"],
+                                 additional_flags=state.get("extra_flags"))
         return {
             "success": result["success"],
             "stderr": result["stderr"],
@@ -153,10 +188,8 @@ def build_graph(config):
         history = state.get("repair_history", [])
         candidates = get_repair_candidates(category)
         selected = next((fn for fn in candidates if fn.__name__ not in history), None)
-
         if selected is None:
             return {"status": "failed_no_candidates"}
-
         result = run_with_timeout(
             selected,
             args=(state["pdb_path"], state["attempt"], state["work_dir"]),
@@ -165,7 +198,6 @@ def build_graph(config):
         )
         if result.get("status") in ("repair_timeout", "repair_error"):
             return {"status": result["status"]}
-
         update = {
             "repair_history": history + [result["op_name"]],
             "status": "repaired",
@@ -178,6 +210,7 @@ def build_graph(config):
         return update
 
     # --- 分岐条件 ---
+
     def route_missing(state):
         n = state["missing_count"]
         if n >= rf_threshold:
@@ -197,6 +230,7 @@ def build_graph(config):
         return "pdb2gmx"
 
     # --- グラフ構築 ---
+
     graph = StateGraph(RecoveryState)
     graph.add_node("check_missing", check_missing)
     graph.add_node("rfdiffusion", rfdiffusion_node)
@@ -210,8 +244,8 @@ def build_graph(config):
         "check_missing", route_missing,
         {"rfdiffusion": "rfdiffusion", "pdbfixer": "pdbfixer", "pdb2gmx": "pdb2gmx"},
     )
-    graph.add_edge("rfdiffusion", "modeller_minimize")   # G: PDB更新 -> 極小化 -> D
-    graph.add_edge("pdbfixer", "modeller_minimize")      # G: PDB更新 -> 極小化 -> D
+    graph.add_edge("rfdiffusion", "modeller_minimize")
+    graph.add_edge("pdbfixer", "modeller_minimize")
     graph.add_edge("modeller_minimize", "pdb2gmx")
     graph.add_conditional_edges("pdb2gmx", route_pdb2gmx, {"end": END, "diagnosis": "diagnosis"})
     graph.add_conditional_edges("diagnosis", route_diagnosis, {"end": END, "pdb2gmx": "pdb2gmx"})
