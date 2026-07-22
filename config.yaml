@@ -9,18 +9,17 @@ agent:
 rfdiffusion:
   script_path: "/path/to/RFdiffusion/scripts/run_inference.py"
   model_directory_path: "/path/to/RFdiffusion/models"
-  min_residues_for_rfdiffusion: 6   # これ以上の欠損はRFdiffusionへ、1〜5残基はPDBfixerへ
+  min_residues_for_rfdiffusion: 6
   num_designs: 1
   timeout_sec: 1800
-  pdb_id: null                          # 例: "6XYZ"。
-  reassign_sequence_from_fasta: true    # RCSB FASTAで新規生成残基の配列を再割り当てするか
-  fasta_cache_dir: "cache/fasta"        # ダウンロードしたFASTAのキャッシュ先(任意)
+  reassign_sequence_from_fasta: true    # ← これが true であること！
+  fasta_cache_dir: "log/fasta_cache"
+  pdb_id: "1ABC"                        # ← 対象のPDB ID
 
 modeller:
-  enabled: true                # RFdiffusion/PDBFixerいずれの経路でも、pdb2gmxの直前に
-                                # 新規生成/補完された残基周辺をMODELLERで局所極小化するか
-  license_key: "YOUR-MODELLER-LICENSE-KEY"  # MODELLER利用登録(無料)で発行されるキー
-  neighbor_window: 3           # 極小化対象に含める前後残基数のマージン
-  cg_iterations: 200           # Conjugate Gradientsの最大反復回数
-  md_iterations: 200           # MD annealingの最大反復回数(300K)
-  timeout_sec: 600             # 極小化処理のタイムアウト(秒、将来のtimeout付き実行用)
+  enabled: true                          # ← false だと極小化スキップ
+  license_key: "MODELLER-YEAR-xxxxx"    # ← プレースホルダーだとスキップ
+  neighbor_window: 3
+  cg_iterations: 200
+  md_iterations: 200
+  timeout_sec: 600
