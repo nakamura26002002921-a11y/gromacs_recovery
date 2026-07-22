@@ -1,24 +1,26 @@
 gromacs:
   force_field: "amber99sb"
   water_model: "spc"
+
 agent:
   max_attempts: 10
-  log_dir: "logs"
+  log_dir: "log"
   keep_work_dir: true
   output_dir: "results"
+  repair_timeout_sec: 300
+
 rfdiffusion:
   script_path: "/path/to/RFdiffusion/scripts/run_inference.py"
   model_directory_path: "/path/to/RFdiffusion/models"
   min_residues_for_rfdiffusion: 6
   num_designs: 1
   timeout_sec: 1800
-  reassign_sequence_from_fasta: true    # ← これが true であること！
+  reassign_sequence_from_fasta: true
   fasta_cache_dir: "log/fasta_cache"
-  pdb_id: "1ABC"                        # ← 対象のPDB ID
 
 modeller:
-  enabled: true                          # ← false だと極小化スキップ
-  license_key: "MODELLER-YEAR-xxxxx"    # ← プレースホルダーだとスキップ
+  enabled: true
+  license_key: "YOUR-MODELLER-LICENSE-KEY"
   neighbor_window: 3
   cg_iterations: 200
   md_iterations: 200
