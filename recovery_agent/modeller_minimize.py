@@ -189,9 +189,12 @@ def minimize_with_modeller(original_pdb_path, repaired_pdb_path, work_dir, model
     if not selection_residues:
         return repaired_pdb_path
 
-    # ModellerのSelectionは複数residueの可変長引数を受け付けるが、
-    # 数百残基規模になりうるため、sum()で単一のSelectionに畳み込む方が安全。
-    atmsel = sum((Selection(r) for r in selection_residues), Selection())
+    # Modeller の Selection オブジェクトは __add__ を実装していないため
+    # sum(Selection, Selection) は使えない(TypeError: unsupported operand
+    # type(s) for +: 'Selection' and 'Selection')。
+    # residueオブジェクトのリストをそのままSelection()に展開して渡すのが
+    # Modeller 10.8で確実に動く方法。
+    atmsel = Selection(selection_residues)
 
     try:
         # 1. Conjugate Gradientsで大きな衝突・歪みを素早く解消
