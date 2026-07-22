@@ -24,4 +24,6 @@ modeller:
   neighbor_window: 3
   cg_iterations: 200
   md_iterations: 200
+  md_temperature_high: 1000
+  md_temperature_low: 300
   timeout_sec: 600
