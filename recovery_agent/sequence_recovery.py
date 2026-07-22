@@ -98,18 +98,7 @@ def _parse_resnum(res_id):
 
 def _build_aligner():
     """
-    Global alignment アライナー。
-
-    【なぜ global か】
-    Local alignment は「部分配列の最適マッチ」を探すため、テンプレート末尾の
-    X(欠損)が連続する領域で、FASTA内の繰り返し配列(GroELのN末/C末相同など)
-    に対して同等のスコアが複数存在し、鎖ごとに異なる経路が選択される問題がある。
-
-    Global alignment はテンプレート全体をターゲット全体に端から端まで張るため、
-    X領域が繰り返し配列に「逃げる」ことができない。
-
-    end_gap_score=0 により、PDBがFASTAのフラグメント(一部)の場合でも
-    末端ギャップにペナルティを課さず柔軟に対応する(semi-global的挙動)。
+    Global alignment アライナー (end gap penalty = 0 で semi-global 的挙動)。
     """
     letters = "ACDEFGHIKLMNPQRSTVWYX"
     matrix = substitution_matrices.Array(alphabet=letters, dims=2)
@@ -127,9 +116,16 @@ def _build_aligner():
     aligner.substitution_matrix = matrix
     aligner.open_gap_score = -10
     aligner.extend_gap_score = -0.5
-    # 末端ギャップはペナルティなし (PDBがFASTAの一部の場合に対応)
-    aligner.target_end_gap_score = 0
-    aligner.query_end_gap_score = 0
+
+    # 末端ギャップはペナルティなし
+    # Biopython >= 1.85 で属性名が変更されたため両対応
+    try:
+        aligner.end_insertion_score = 0   # 新: target_end_gap_score の後継
+        aligner.end_deletion_score = 0    # 新: query_end_gap_score の後継
+    except AttributeError:
+        aligner.target_end_gap_score = 0  # 旧
+        aligner.query_end_gap_score = 0   # 旧
+
     return aligner
 
 
