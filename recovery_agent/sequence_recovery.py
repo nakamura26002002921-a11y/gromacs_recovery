@@ -1,29 +1,23 @@
 # recovery_agent/sequence_recovery.py
 """
-RFdiffusion出力(GLYまみれ)の複合体PDBに正しいアミノ酸名を割り当てる。
+rfdiffusion_final_merged.pdb (GLYまみれ) に正しいアミノ酸名を割り当てる。
 
-【設計方針】
-アラインメント(Biopython PairwiseAligner)は使わない。
-代わりに「アンカーベースの位置マッピング」を主アルゴリズムとする。
+アルゴリズム:
+  1. 元PDBからPDBFixerで欠損resnumを検出 (rfdiffusion_repair.pyと同じロジック)
+  2. 元PDBの実在残基(先頭〜15残基)をアンカーにFASTA内でstr.find()
+  3. オフセットを確定し、欠損resnum → FASTA[offset + i] を直接参照
+  4. 同一パターンの鎖(ホモマー)は1回だけ計算して全鎖に適用
 
-理由:
-- BiopythonのPairwiseAlignerはglobal+カスタム行列+end_gap_score=0で
-  破綻したアラインメントを返すことがある(1AONで実証)
-- PDBとFASTAが同じタンパク質を表現している場合、非欠損残基をアンカーに
-  すればオフセットは一意に決まり、アラインメントは不要
-- 同一配列のホモマー(GroEL 14量体など)でも確実に全鎖同一結果になる
+アラインメントライブラリ・ハンガリー法・Biopython PairwiseAligner は一切不使用。
 """
 import os
 import re
 import requests
-import numpy as np
-from scipy.optimize import linear_sum_assignment
 from Bio.Data.IUPACData import protein_letters_3to1
 from Bio.PDB import PDBParser, PDBIO
 from pdbfixer import PDBFixer
 
 RCSB_FASTA_URL = "https://www.rcsb.org/fasta/entry/{pdb_id}"
-
 _THREE_TO_ONE = {k.upper(): v for k, v in protein_letters_3to1.items()}
 _ONE_TO_THREE = {v: k.upper() for k, v in protein_letters_3to1.items()}
 
@@ -41,16 +35,12 @@ def fetch_rcsb_fasta(pdb_id, cache_dir=None, timeout=30):
             with open(cache_path, "r", encoding="utf-8") as f:
                 return f.read()
     url = RCSB_FASTA_URL.format(pdb_id=pdb_id)
-    try:
-        resp = requests.get(url, timeout=timeout)
-        resp.raise_for_status()
-        text = resp.text
-    except requests.RequestException as e:
-        raise RuntimeError(f"RCSB FASTA download failed (pdb_id={pdb_id}): {e}")
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
     if cache_path:
         with open(cache_path, "w", encoding="utf-8") as f:
-            f.write(text)
-    return text
+            f.write(resp.text)
+    return resp.text
 
 
 def parse_rcsb_fasta(fasta_text):
@@ -89,297 +79,200 @@ def _parse_resnum(res_id):
 
 
 # ============================================================================
-# コア: アンカーベース位置マッピング (アラインメント不使用)
+# コア: オフセット決定 + 直接参照
 # ============================================================================
 
-def _find_offset_by_anchor(template_seq, target_seq, anchor_len=15):
+def _determine_offset(present_residues_sorted, fasta_seq):
     """
-    テンプレート先頭の非X残基(アンカー)をFASTA内で探索し、
-    テンプレート位置 → FASTA位置 のオフセットを決定する。
+    実在残基の先頭アンカーをFASTA内でstr.find()し、
+    PDB resnum → FASTA position のオフセットを決定する。
 
-    :param template_seq: "AAKDVK...XXXXX" (X=欠損)
-    :param target_seq:   "AAKDVK..." (FASTA配列)
-    :param anchor_len:   アンカーに使う残基数
-    :return: offset (int) または None
+    :param present_residues_sorted: [(resnum, one_letter_aa), ...] resnum昇順
+    :param fasta_seq: FASTA配列 (1文字)
+    :return: offset (int) or None
+             offset の意味: FASTA[resnum + offset] がその残基の正しいアミノ酸
     """
-    # テンプレート先頭から連続する非X残基をアンカーとして抽出
-    anchor = []
-    for ch in template_seq:
-        if ch == "X":
-            break
-        anchor.append(ch)
-        if len(anchor) >= anchor_len:
-            break
-
-    if len(anchor) < 5:
-        # 先頭がXで始まる場合、末尾から試す
-        anchor = []
-        for ch in reversed(template_seq):
-            if ch == "X":
-                break
-            anchor.append(ch)
-            if len(anchor) >= anchor_len:
-                break
-        anchor = anchor[::-1]
-        if len(anchor) < 5:
-            return None
-        # 末尾アンカーのオフセットを計算
-        anchor_str = "".join(anchor)
-        # テンプレート内でのアンカー開始位置
-        t_start = len(template_seq) - len(anchor)
-        pos = target_seq.find(anchor_str)
-        if pos >= 0:
-            return pos - t_start
-        # 部分マッチ (アンカーの先頭10残基で再試行)
-        partial = anchor_str[:10]
-        pos = target_seq.find(partial)
-        if pos >= 0:
-            return pos - t_start
+    if not present_residues_sorted or not fasta_seq:
         return None
 
-    anchor_str = "".join(anchor)
+    # アンカー: 先頭15残基の1文字配列
+    anchor_len = min(15, len(present_residues_sorted))
+    anchor = "".join(aa for _, aa in present_residues_sorted[:anchor_len])
+
     # 完全マッチ
-    pos = target_seq.find(anchor_str)
+    pos = fasta_seq.find(anchor)
     if pos >= 0:
-        return pos  # テンプレート位置0 → FASTA位置pos
+        offset = pos - present_residues_sorted[0][0]
+        return offset
 
-    # 部分マッチ (アンカーの先頭10残基)
-    partial = anchor_str[:10]
-    pos = target_seq.find(partial)
-    if pos >= 0:
-        return pos
+    # 部分マッチ (10残基)
+    if anchor_len > 10:
+        pos = fasta_seq.find(anchor[:10])
+        if pos >= 0:
+            offset = pos - present_residues_sorted[0][0]
+            return offset
 
-    # 部分マッチ (アンカーの先頭7残基)
-    partial = anchor_str[:7]
-    pos = target_seq.find(partial)
-    if pos >= 0:
-        return pos
+    # 部分マッチ (7残基)
+    if anchor_len > 7:
+        pos = fasta_seq.find(anchor[:7])
+        if pos >= 0:
+            offset = pos - present_residues_sorted[0][0]
+            return offset
 
     return None
 
 
-def _recover_chain_by_positional_mapping(template_seq, target_seq, resnums_sorted, gen_resnums):
+def _verify_offset(present_residues_sorted, fasta_seq, offset):
+    """オフセットの正しさを全実在残基で検証。一致率を返す。"""
+    match = 0
+    total = 0
+    for resnum, aa in present_residues_sorted:
+        fp = resnum + offset
+        if 0 <= fp < len(fasta_seq):
+            total += 1
+            if aa == fasta_seq[fp]:
+                match += 1
+    return match / max(total, 1)
+
+
+def _find_fasta_for_chain(present_residues_sorted, fasta_sequences):
     """
-    アンカーベースの位置マッピングで1鎖の欠損残基を復元する。
-
-    1. テンプレート先頭の非X残基でFASTA内のオフセットを決定
-    2. オフセットを適用して全欠損位置のFASTA残基を読み取る
-    3. 検証: 非欠損位置の一致率をチェック
+    全FASTA鎖の中から、実在残基と最も一致する鎖とオフセットを見つける。
     """
-    if not template_seq or not target_seq or not gen_resnums:
-        return {}
+    best_cid = None
+    best_offset = None
+    best_identity = 0.0
 
-    offset = _find_offset_by_anchor(template_seq, target_seq)
-    if offset is None:
-        return {}
-
-    # 検証: 非X位置の一致率
-    match_count = 0
-    check_count = 0
-    for i, ch in enumerate(template_seq):
-        if ch != "X":
-            tp = offset + i
-            if 0 <= tp < len(target_seq):
-                check_count += 1
-                if ch == target_seq[tp]:
-                    match_count += 1
-
-    identity = match_count / max(check_count, 1)
-    if identity < 0.80:
-        # オフセットが間違っている可能性 → 全オフセットをブルートフォース探索
-        best_offset = offset
-        best_identity = identity
-        for trial_offset in range(-5, len(target_seq) - len(template_seq) + 6):
-            mc = 0
-            cc = 0
-            for i, ch in enumerate(template_seq):
-                if ch != "X":
-                    tp = trial_offset + i
-                    if 0 <= tp < len(target_seq):
-                        cc += 1
-                        if ch == target_seq[tp]:
-                            mc += 1
-            trial_id = mc / max(cc, 1)
-            if trial_id > best_identity:
-                best_identity = trial_id
-                best_offset = trial_offset
-        offset = best_offset
-        identity = best_identity
-
-    if identity < 0.50:
-        return {}
-
-    # マッピング実行
-    mapping = {}
-    for i, resnum in enumerate(resnums_sorted):
-        if resnum in gen_resnums:
-            tp = offset + i
-            if 0 <= tp < len(target_seq):
-                aa = target_seq[tp]
-                if aa.isalpha():
-                    mapping[resnum] = _ONE_TO_THREE.get(aa, "GLY")
-    return mapping
-
-
-# ============================================================================
-# 複合体全体の最適化 (ハンガリー法で鎖マッピング)
-# ============================================================================
-
-def recover_complex_sequences(pdb_complex_residues, generated_resnums_dict, fasta_sequences):
-    """
-    MM-align的思想: ハンガリー法で複合体全体の鎖マッピングを最適化。
-    各鎖の復元はアンカーベース位置マッピング(アラインメント不使用)。
-    """
-    pdb_chain_ids = list(pdb_complex_residues.keys())
-    fasta_chain_ids = list(fasta_sequences.keys())
-
-    if not pdb_chain_ids or not fasta_chain_ids:
-        return {}
-
-    # --- テンプレート構築 ---
-    template_seqs = {}
-    sorted_resnums_dict = {}
-
-    for p_cid in pdb_chain_ids:
-        orig_residues = pdb_complex_residues[p_cid]
-        gen_resnums = generated_resnums_dict.get(p_cid, set())
-        all_resnums = set(orig_residues.keys()) | gen_resnums
-        resnums_sorted = sorted(all_resnums, key=_parse_resnum)
-        sorted_resnums_dict[p_cid] = resnums_sorted
-
-        if not resnums_sorted:
-            template_seqs[p_cid] = ""
+    for f_cid, f_seq in fasta_sequences.items():
+        offset = _determine_offset(present_residues_sorted, f_seq)
+        if offset is None:
             continue
+        identity = _verify_offset(present_residues_sorted, f_seq, offset)
+        if identity > best_identity:
+            best_identity = identity
+            best_cid = f_cid
+            best_offset = offset
 
-        template_seq = "".join(
-            "X" if rn in gen_resnums
-            else _THREE_TO_ONE.get(str(orig_residues[rn]).upper(), "X")
-            for rn in resnums_sorted
-        )
-        template_seqs[p_cid] = template_seq
-
-    # --- コスト行列: アンカーマッチ数でスコアリング ---
-    # (アラインメントスコアの代わりに、アンカーの完全マッチ長を使用)
-    cost_matrix = np.zeros((len(pdb_chain_ids), len(fasta_chain_ids)))
-
-    for i, p_cid in enumerate(pdb_chain_ids):
-        t_seq = template_seqs[p_cid]
-        if not t_seq:
-            continue
-        for j, f_cid in enumerate(fasta_chain_ids):
-            f_seq = fasta_sequences[f_cid]
-            if not f_seq:
-                continue
-            # スコア = 長さ類似度 + アンカーマッチ
-            len_score = -abs(len(t_seq) - len(f_seq))
-            offset = _find_offset_by_anchor(t_seq, f_seq, anchor_len=10)
-            anchor_score = 0
-            if offset is not None:
-                # アンカー位置の一致数をカウント
-                for k, ch in enumerate(t_seq[:20]):
-                    if ch != "X":
-                        tp = offset + k
-                        if 0 <= tp < len(f_seq) and ch == f_seq[tp]:
-                            anchor_score += 1
-            cost_matrix[i, j] = -(len_score + anchor_score * 10)
-
-    # --- ハンガリー法 ---
-    row_ind, col_ind = linear_sum_assignment(cost_matrix)
-    optimal_mapping = {}
-    for r, c in zip(row_ind, col_ind):
-        if cost_matrix[r, c] < 0:
-            optimal_mapping[pdb_chain_ids[r]] = fasta_chain_ids[c]
-
-    # --- 各鎖の復元 (位置マッピング) ---
-    complex_results = {}
-    for p_cid, f_cid in optimal_mapping.items():
-        t_seq = template_seqs[p_cid]
-        f_seq = fasta_sequences[f_cid]
-        resnums_sorted = sorted_resnums_dict[p_cid]
-        gen_resnums = generated_resnums_dict.get(p_cid, set())
-
-        mapping = _recover_chain_by_positional_mapping(
-            t_seq, f_seq, resnums_sorted, gen_resnums
-        )
-        if mapping:
-            complex_results[p_cid] = mapping
-
-    return complex_results
+    if best_identity < 0.80:
+        return None, None
+    return best_cid, best_offset
 
 
 # ============================================================================
-# 欠損検出
+# メイン
 # ============================================================================
 
-def _get_generated_resnums_from_original(original_pdb_path):
+def apply_sequence_recovery(original_pdb_path, rfdiffusion_pdb_path, work_dir, pdb_id,
+                            out_name="sequence_recovered.pdb", cache_dir=None):
+    """
+    rfdiffusion_final_merged.pdb のGLY残基を正しいアミノ酸名に置換する。
+
+    :param original_pdb_path: RFdiffusion実行前の元PDB (欠損あり)
+    :param rfdiffusion_pdb_path: rfdiffusion_final_merged.pdb (GLY埋め済み)
+    :param work_dir: 出力先ディレクトリ
+    :param pdb_id: RCSB PDB ID
+    :param out_name: 出力ファイル名
+    :param cache_dir: FASTAキャッシュディレクトリ
+    """
+    # --- 1. 元PDBから欠損情報を取得 (rfdiffusion_repair.pyと同じロジック) ---
     fixer = PDBFixer(filename=original_pdb_path)
     fixer.findMissingResidues()
 
-    pdb_complex_residues = {}
-    generated_resnums_dict = {}
+    # 鎖ごとに「実在残基」と「欠損resnum」を収集
+    chain_data = {}  # {cid: {"present": [(resnum, aa), ...], "missing": {resnum, ...}}}
 
     for chain in fixer.topology.chains():
         cid = chain.id
         residues = list(chain.residues())
         if not residues:
             continue
-        pdb_complex_residues[cid] = {}
-        for res in residues:
-            pdb_complex_residues[cid][_parse_resnum(res.id)] = res.name
 
-    for chain in fixer.topology.chains():
-        cid = chain.id
-        residues = list(chain.residues())
+        present = []
+        for res in residues:
+            rn = _parse_resnum(res.id)
+            aa = _THREE_TO_ONE.get(res.name.upper(), "X")
+            present.append((rn, aa))
+        present.sort(key=lambda x: x[0])
+
+        # 欠損resnumの計算
         gaps = sorted(
             ((pos, names) for (ci, pos), names in fixer.missingResidues.items()
              if ci == chain.index),
             key=lambda x: x[0],
         )
-        gen_resnums = set()
+        missing = set()
         for pos, names in gaps:
             gap_len = len(names)
             if pos == 0:
                 start = _parse_resnum(residues[0].id) - gap_len
             else:
-                prev_resnum = _parse_resnum(residues[pos - 1].id)
-                start = prev_resnum + 1
-            end = start + gap_len - 1
-            for resnum in range(start, end + 1):
-                gen_resnums.add(resnum)
-        if gen_resnums:
-            generated_resnums_dict[cid] = gen_resnums
+                prev_rn = _parse_resnum(residues[pos - 1].id)
+                start = prev_rn + 1
+            for rn in range(start, start + gap_len):
+                missing.add(rn)
 
-    return pdb_complex_residues, generated_resnums_dict
+        if missing:
+            chain_data[cid] = {"present": present, "missing": missing}
 
-
-# ============================================================================
-# メインエントリポイント
-# ============================================================================
-
-def apply_sequence_recovery(original_pdb_path, rfdiffusion_pdb_path, work_dir, pdb_id,
-                            out_name="sequence_recovered.pdb", cache_dir=None):
-    pdb_complex_residues, generated_resnums_dict = _get_generated_resnums_from_original(
-        original_pdb_path
-    )
-    if not generated_resnums_dict or not pdb_id:
+    if not chain_data or not pdb_id:
         return rfdiffusion_pdb_path
 
+    # --- 2. FASTA取得 ---
     fasta_text = fetch_rcsb_fasta(pdb_id, cache_dir=cache_dir)
     fasta_sequences = parse_rcsb_fasta(fasta_text)
-
-    complex_corrections = recover_complex_sequences(
-        pdb_complex_residues=pdb_complex_residues,
-        generated_resnums_dict=generated_resnums_dict,
-        fasta_sequences=fasta_sequences,
-    )
-    if not complex_corrections:
+    if not fasta_sequences:
         return rfdiffusion_pdb_path
 
+    # --- 3. ホモマー重複排除: 同一パターンの鎖は1回だけ計算 ---
+    # キー: (実在残基の1文字配列, 欠損resnumのfrozenset)
+    pattern_cache = {}  # pattern_key → {resnum: resname}
+    corrections = {}    # {cid: {resnum: resname}}
+
+    for cid, data in chain_data.items():
+        present = data["present"]
+        missing = data["missing"]
+
+        # パターンキー: 実在配列 + 欠損位置
+        present_seq = "".join(aa for _, aa in present)
+        pattern_key = (present_seq, frozenset(missing))
+
+        if pattern_key in pattern_cache:
+            # 同一パターン → キャッシュから再利用
+            corrections[cid] = dict(pattern_cache[pattern_key])
+            continue
+
+        # FASTA鎖とオフセットを決定
+        fasta_cid, offset = _find_fasta_for_chain(present, fasta_sequences)
+        if fasta_cid is None:
+            print(f"  [Warning] Chain {cid}: no suitable FASTA match found, skipping.")
+            continue
+
+        f_seq = fasta_sequences[fasta_cid]
+
+        # 欠損resnum → FASTA参照で正しいアミノ酸を決定
+        mapping = {}
+        for resnum in sorted(missing):
+            fp = resnum + offset
+            if 0 <= fp < len(f_seq):
+                aa = f_seq[fp]
+                if aa.isalpha():
+                    mapping[resnum] = _ONE_TO_THREE.get(aa, "GLY")
+
+        corrections[cid] = mapping
+        pattern_cache[pattern_key] = mapping
+
+        print(f"  [Info] Chain {cid}: matched FASTA chain {fasta_cid} "
+              f"(offset={offset}, recovered {len(mapping)}/{len(missing)} residues)")
+
+    if not corrections:
+        return rfdiffusion_pdb_path
+
+    # --- 4. rfdiffusion_final_merged.pdb のGLYを置換 ---
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("seqrec", rfdiffusion_pdb_path)
     model = structure[0]
 
-    for cid, resnum_to_resname in complex_corrections.items():
+    for cid, resnum_to_resname in corrections.items():
         if cid not in model:
             continue
         chain = model[cid]
@@ -396,9 +289,21 @@ def apply_sequence_recovery(original_pdb_path, rfdiffusion_pdb_path, work_dir, p
     return out_path
 
 
+# 後方互換ラッパー
 def map_generated_residues_to_sequence(chain_id, orig_chain_residues, generated_resnums,
                                        fasta_sequences):
-    pdb_complex = {chain_id: orig_chain_residues}
-    gen_dict = {chain_id: generated_resnums}
-    results = recover_complex_sequences(pdb_complex, gen_dict, fasta_sequences)
-    return results.get(chain_id, {})
+    present = sorted(
+        [(rn, _THREE_TO_ONE.get(str(name).upper(), "X"))
+         for rn, name in orig_chain_residues.items()],
+        key=lambda x: x[0]
+    )
+    fasta_cid, offset = _find_fasta_for_chain(present, fasta_sequences)
+    if fasta_cid is None:
+        return {}
+    f_seq = fasta_sequences[fasta_cid]
+    mapping = {}
+    for resnum in generated_resnums:
+        fp = resnum + offset
+        if 0 <= fp < len(f_seq):
+            mapping[resnum] = _ONE_TO_THREE.get(f_seq[fp], "GLY")
+    return mapping
