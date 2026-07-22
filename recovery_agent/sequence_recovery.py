@@ -307,3 +307,47 @@ def map_generated_residues_to_sequence(chain_id, orig_chain_residues, generated_
         if 0 <= fp < len(f_seq):
             mapping[resnum] = _ONE_TO_THREE.get(f_seq[fp], "GLY")
     return mapping
+
+def _get_generated_resnums_from_original(original_pdb_path):
+    """
+    元PDBからPDBFixerで欠損を検出する。
+    テストスクリプト(test_real_data.py)の診断表示用。
+    apply_sequence_recovery内部でも同じロジックを使用。
+    """
+    fixer = PDBFixer(filename=original_pdb_path)
+    fixer.findMissingResidues()
+
+    pdb_complex_residues = {}
+    generated_resnums_dict = {}
+
+    for chain in fixer.topology.chains():
+        cid = chain.id
+        residues = list(chain.residues())
+        if not residues:
+            continue
+        pdb_complex_residues[cid] = {}
+        for res in residues:
+            pdb_complex_residues[cid][_parse_resnum(res.id)] = res.name
+
+    for chain in fixer.topology.chains():
+        cid = chain.id
+        residues = list(chain.residues())
+        gaps = sorted(
+            ((pos, names) for (ci, pos), names in fixer.missingResidues.items()
+             if ci == chain.index),
+            key=lambda x: x[0],
+        )
+        gen_resnums = set()
+        for pos, names in gaps:
+            gap_len = len(names)
+            if pos == 0:
+                start = _parse_resnum(residues[0].id) - gap_len
+            else:
+                prev_rn = _parse_resnum(residues[pos - 1].id)
+                start = prev_rn + 1
+            for rn in range(start, start + gap_len):
+                gen_resnums.add(rn)
+        if gen_resnums:
+            generated_resnums_dict[cid] = gen_resnums
+
+    return pdb_complex_residues, generated_resnums_dict
