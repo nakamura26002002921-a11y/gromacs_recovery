@@ -76,14 +76,15 @@ def minimize_with_modeller(original_pdb_path, repaired_pdb_path, work_dir, model
     atmsel = Selection(sel_residues)
     cg_iter = modeller_config.get("cg_iterations", 200)
     md_iter = modeller_config.get("md_iterations", 200)
+    temp_high = modeller_config.get("md_temperature_high", 1000)
+    temp_low = modeller_config.get("md_temperature_low", 300)
 
     cg = ConjugateGradients(output="NO_REPORT")
     cg.optimize(atmsel, max_iterations=cg_iter)
-
     md = MolecularDynamics(output="NO_REPORT")
-    md.optimize(atmsel, temperature=300, max_iterations=md_iter,
+    md.optimize(atmsel, temperature=temp_high, max_iterations=md_iter,
                 actions=[actions.trace(10, os.path.join(work_dir, "modeller_md_trace.log"))])
-
+    md.optimize(atmsel, temperature=temp_low, max_iterations=md_iter)
     cg.optimize(atmsel, max_iterations=cg_iter)
 
     out_path = os.path.join(work_dir, out_name)
